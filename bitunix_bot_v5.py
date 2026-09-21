@@ -25,14 +25,17 @@ INTERVAL_MS = {"1h": 3600e3, "4h": 14400e3}
 
 @dataclass
 class Config:
-    symbols: list = field(default_factory=lambda: ["ETHUSDT", "SOLUSDT", "BNBUSDT", "BTCUSDT"])
+    symbols: list = field(default_factory=lambda: ["ETHUSDT", "SOLUSDT", "BNBUSDT", "BTCUSDT", "DOTUSDT", "NEARUSDT"])
     signal_map: dict = field(default_factory=lambda: {"ETHUSDT": ["ignition", "donchian"],
                                                       "SOLUSDT": ["ignition", "donchian"],
                                                       "BNBUSDT": ["ignition"],
-                                                      "BTCUSDT": ["donchian"]})
-    risk_map: dict = field(default_factory=lambda: {"ETHUSDT": 0.015, "SOLUSDT": 0.015,
-                                                      "BNBUSDT": 0.0075, "BTCUSDT": 0.005})
-    max_open_risk: float = 0.03
+                                                      "BTCUSDT": ["donchian"],
+                                                      "DOTUSDT": ["donchian"],      # scanner sleeve - validated 2 windows
+                                                      "NEARUSDT": ["ignition"]})    # scanner sleeve - validated 2 windows
+    risk_map: dict = field(default_factory=lambda: {"ETHUSDT": 0.030, "SOLUSDT": 0.030,   # user request: target ~5%/mo
+                                                      "BNBUSDT": 0.015, "BTCUSDT": 0.010,
+                                                      "DOTUSDT": 0.015, "NEARUSDT": 0.015})
+    max_open_risk: float = 0.06
     entry_limit: bool = True        # lever 1: maker-limit entries (free ~+0.5-1%/mo)
     limit_offset: float = 0.0005    # place limit 0.05% better than signal price
     entry_timeout_bars: int = 2     # bars to wait for fill, then cancel
@@ -330,6 +333,8 @@ class Bot:
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         notify(f"LeverageLord is alive | dry_run={self.cfg.dry_run} | watching {','.join(self.cfg.symbols)}")
+        beats = 0
+        beats_between = max(1, 3600 // max(self.cfg.poll_seconds, 1))   # ~1 per hour
         while True:
             try:
                 if not self.cfg.dry_run: self.sync()
@@ -342,6 +347,12 @@ class Bot:
                 if self.risk.daily_loss_hit(eq) or self.risk.kill_switch():
                     time.sleep(self.cfg.poll_seconds); continue
                 for sym in self.cfg.symbols: self.run_symbol(sym, eq)
+                beats += 1
+                if beats >= beats_between:
+                    beats = 0
+                    wins = sum(self.risk.trades); n = len(self.risk.trades)
+                    wr = f"{wins/n*100:.0f}%" if n else "n/a"
+                    notify(f"Heartbeat | equity ${eq:.2f} | open pos {len(self.open_pos)} | trades {n} (WR {wr}) | halted={self.risk.halted_today or self.risk.killed}")
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
                 logging.error(f"loop error: {ex}"); time.sleep(60)
