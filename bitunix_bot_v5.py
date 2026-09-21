@@ -61,6 +61,7 @@ FEE_M, FEE_T, SLIP = 0.0002, 0.0006, 0.0002
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
     handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()])
 
+_ACCT_DEBUGGED = False
 _TG_TOKEN = os.getenv("TG_TOKEN", "")
 _TG_CHAT = os.getenv("TG_CHAT", "")
 def notify(msg):
@@ -102,18 +103,28 @@ class BitunixClient:
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
     def equity_usdt(self):
-        acct = None
-        for path in ["/api/v1/futures/account/assets",
-                     "/api/v1/futures/account/get_assets",
-                     "/api/v1/futures/account/get_account"]:
+        acct = None; used = "?"
+        for path in ["/api/v1/futures/account",              # CONFIRMED: Bitunix "Get Single Account"
+                     "/api/v1/futures/account/assets"]:
             try:
                 acct = self._req("GET", path, {"marginCoin": "USDT"})
-                if acct is not None: break
+                if acct is not None:
+                    used = path; break
             except Exception:
                 continue
-        a = acct[0] if acct else {}
-        return (float(a.get("available",0)) + float(a.get("margin",0))
-                + float(a.get("crossUnrealizedPNL",0)) + float(a.get("isolationUnrealizedPNL",0)))
+        if acct is None:
+            raise RuntimeError("account endpoint unreachable (all paths 404)")
+        a = acct[0] if isinstance(acct, list) and acct else (acct if isinstance(acct, dict) else {})
+        global _ACCT_DEBUGGED
+        if not _ACCT_DEBUGGED:
+            _ACCT_DEBUGGED = True
+            logging.info(f"ACCOUNT RAW via {used}: {json.dumps(a)[:300]}")
+        def f(*keys):
+            for k in keys:
+                if k in a and a[k] not in (None, ""):
+                    return float(a[k])
+            return 0.0
+        return f("available","availableVol","availableBalance") + f("margin","positionMargin") + f("crossUnrealizedPNL") + f("isolationUnrealizedPNL")
     def positions(self, symbol=None):
         params = {"symbol": symbol} if symbol else {}
         rows = None
@@ -156,7 +167,8 @@ class RiskManager:
         today=datetime.now(timezone.utc).date()
         if today!=self.day: self.day,self.halted_today=today,False; self.day_start_equity=equity
         self.day_start_equity=self.day_start_equity or equity
-        if not self.halted_today and equity<=self.day_start_equity*(1-self.cfg.daily_loss_limit):
+        if (not self.halted_today and self.day_start_equity and equity>0
+                and equity<=self.day_start_equity*(1-self.cfg.daily_loss_limit)):
             self.halted_today=True; logging.warning("CIRCUIT BREAKER: daily loss limit hit."); notify("BREAKER: daily loss limit hit - trading halted today")
         return self.halted_today
     def record_trade(self, pnl): self.trades.append(pnl>0)
@@ -302,6 +314,11 @@ class Bot:
             try:
                 if not self.cfg.dry_run: self.sync()
                 eq=self.equity()
+                if eq<=0:
+                    if not getattr(self,"_warned_eq",False):
+                        self._warned_eq=True
+                        logging.error("equity read as 0 - API parse problem, skipping cycles"); notify("WARN: can't read balance (got 0). Trading paused - check logs")
+                    time.sleep(self.cfg.poll_seconds); continue
                 if self.risk.daily_loss_hit(eq) or self.risk.kill_switch():
                     time.sleep(self.cfg.poll_seconds); continue
                 for sym in self.cfg.symbols: self.run_symbol(sym, eq)
