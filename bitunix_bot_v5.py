@@ -101,22 +101,43 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
-    def equity_usdt(self):  # VERIFY path
-        a = self._req("GET", "/api/v1/futures/account/assets", {"marginCoin": "USDT"})
-        a = a[0] if a else {}
-        return float(a.get("available",0))+float(a.get("margin",0))+float(a.get("crossUnrealizedPNL",0))
-    def positions(self, symbol=None):  # VERIFY path/fields
+    def equity_usdt(self):
+        acct = None
+        for path in ["/api/v1/futures/account/assets",
+                     "/api/v1/futures/account/get_assets",
+                     "/api/v1/futures/account/get_account"]:
+            try:
+                acct = self._req("GET", path, {"marginCoin": "USDT"})
+                if acct is not None: break
+            except Exception:
+                continue
+        a = acct[0] if acct else {}
+        return (float(a.get("available",0)) + float(a.get("margin",0))
+                + float(a.get("crossUnrealizedPNL",0)) + float(a.get("isolationUnrealizedPNL",0)))
+    def positions(self, symbol=None):
         params = {"symbol": symbol} if symbol else {}
-        rows = self._req("GET", "/api/v1/futures/position/pending_positions", params) or []
+        rows = None
+        for path in ["/api/v1/futures/position/get_pending_positions",   # confirmed from Bitunix docs
+                     "/api/v1/futures/position/pending_positions"]:
+            try:
+                rows = self._req("GET", path, params)
+                if rows is not None: break
+            except Exception:
+                continue
+        rows = rows or []
         out=[]
         for p in rows:
             q=float(p.get("qty") or p.get("size") or p.get("positionSize") or 0)
             if q>0: out.append({"id":str(p.get("positionId")), "sym":p["symbol"],
                                 "side":1 if p.get("side")=="LONG" else -1, "qty":q})
         return out
-    def cancel(self, symbol, order_id):   # VERIFY path
-        return self._req("POST", "/api/v1/futures/trade/cancel_order",
-                         payload={"symbol": symbol, "orderId": str(order_id)})
+    def cancel(self, symbol, order_id):
+        for path in ["/api/v1/futures/trade/cancel_order",
+                     "/api/v1/futures/order/cancel_order"]:
+            try:
+                return self._req("POST", path, payload={"symbol": symbol, "orderId": str(order_id)})
+            except Exception:
+                continue
     def place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
               stop=None, target=None, tick=0.01):
         payload={"symbol":symbol,"side":side,"qty":fmt_qty(qty),"tradeSide":trade_side,
@@ -286,7 +307,7 @@ class Bot:
                 for sym in self.cfg.symbols: self.run_symbol(sym, eq)
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
-                logging.error(f"loop error: {ex}"); time.sleep(30)
+                logging.error(f"loop error: {ex}"); time.sleep(60)
 
 if __name__ == "__main__":
     cfg = Config(dry_run=os.getenv("DRY_RUN","true").lower()!="false")
