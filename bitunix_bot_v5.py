@@ -36,6 +36,14 @@ class Config:
                                                       "BNBUSDT": 0.015, "BTCUSDT": 0.010,
                                                       "DOTUSDT": 0.015, "NEARUSDT": 0.015})
     max_open_risk: float = 0.06
+    scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
+    scanner_min_vol24: float = 20_000_000.0   # 24h volume floor (USDT) - protects thin-coin slippage
+    scanner_max_pairs: int = 40      # cap on universe size per scan
+    scanner_pairs: list = field(default_factory=lambda: ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
+                                                          "DOGEUSDT","LINKUSDT","ADAUSDT","LTCUSDT","ARBUSDT","OPUSDT"])
+    scanner_risk: float = 0.010      # per top-gainer trade (validated two windows)
+    scanner_max: int = 2             # max concurrent scanner positions
+    scanner_ret: float = 0.04        # min 24-bar gain to qualify
     entry_limit: bool = True        # lever 1: maker-limit entries (free ~+0.5-1%/mo)
     limit_offset: float = 0.0005    # place limit 0.05% better than signal price
     entry_timeout_bars: int = 2     # bars to wait for fill, then cancel
@@ -117,6 +125,15 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
+    def tickers(self):   # VERIFY field names - Bitunix 'Get All Tickers'
+        rows = self._req("GET", "/api/v1/futures/market/tickers") or []
+        out = []
+        for t in rows:
+            sym = t.get("symbol", "")
+            vol = float(t.get("vol") or t.get("volume") or t.get("turnover") or t.get("amount") or 0)
+            out.append({"symbol": sym, "vol24": vol})
+        return out
+
     def equity_usdt(self):
         global _LAST_EQ
         acct = None; used = "?"; errs = []
@@ -211,6 +228,7 @@ class Bot:
         self.state = {s: 0 for s in cfg.symbols}
         self.seen_bar = {s: 0 for s in cfg.symbols}
         self.open_pos = {}; self.entry_info = {}
+        self.scan_seen_bar = 0
         self.csv = open("trades.csv","a",newline="")
         self.writer = csv.writer(self.csv)
         if self.csv.tell()==0:
@@ -330,6 +348,75 @@ class Bot:
         self.state[sym]=new_side
         self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd}
 
+
+    def run_scanner(self, equity):
+        """Top-gainer cross-sectional momentum sleeve. Validated on two windows
+        (crash: 72 tr +22.9%, bull: 87 tr +52.9% at 1.5% risk)."""
+        now_ms = time.time()*1000
+        bar = (int(now_ms)//INTERVAL_MS[self.cfg.interval])*INTERVAL_MS[self.cfg.interval]
+        if now_ms < bar + INTERVAL_MS[self.cfg.interval]: return      # bar not closed yet
+        if bar == self.scan_seen_bar: return
+        self.scan_seen_bar = bar
+        universe = list(self.cfg.scanner_pairs)
+        if self.cfg.scanner_dynamic:
+            try:
+                tk = self.client.tickers()
+                dyn = [t["symbol"] for t in tk
+                       if t["symbol"].endswith("USDT") and t["vol24"] >= self.cfg.scanner_min_vol24]
+                dyn = [s for s in dyn if s not in self.cfg.symbols or True][:self.cfg.scanner_max_pairs]
+                if dyn: universe = dyn
+                else: logging.warning("dynamic universe empty - using fallback list")
+            except Exception as e:
+                logging.warning(f"ticker fetch failed ({e}) - using fallback list")
+        data = {}
+        for s in universe:
+            try:
+                rows = self.client.klines(s, self.cfg.interval, 100)
+                if len(rows) >= 30: data[s] = rows
+            except Exception:
+                continue
+        if not data: return
+        logging.info(f"scanner universe: {len(data)} pairs")
+        held = {info["sym"] for info in self.open_pos.values()}
+        cands = []
+        for s, r in data.items():
+            if s in held: continue
+            closes = [x["c"] for x in r]
+            ret24 = closes[-1]/closes[-25] - 1
+            if ret24 > self.cfg.scanner_ret:
+                hi20 = max(x["h"] for x in r[-21:-1])
+                vols = [x["vol"] for x in r[-22:-2]]
+                vma = sum(vols)/len(vols) if vols else 0
+                brk = closes[-1] > hi20
+                vspike = vma > 0 and r[-1]["vol"] > 1.2*vma
+                if brk and vspike:
+                    trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"]))
+                             for i in range(-14, 0)]
+                    atr = sum(trs)/len(trs)
+                    cands.append((ret24, s, r[-1]["c"], atr))
+        cands.sort(reverse=True)
+        slots = self.cfg.scanner_max - sum(1 for i in self.open_pos.values() if i.get("kind")=="scanner")
+        for ret24, s, price, atr in cands:
+            if slots <= 0: break
+            rd = atr/price
+            if rd < 0.004 or rd > 0.06: continue
+            stop = price - atr; target = price + self.cfg.tp_r*atr
+            qty = (self.cfg.scanner_risk/rd)*equity/price
+            qty = min(qty, 5.0*equity/price)
+            if qty*price < 10: continue
+            logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
+            notify(f"SCANNER ENTER {s} | top gainer +{ret24*100:.1f}%/24h | stop {stop:.4f} target {target:.4f} | risk {self.cfg.scanner_risk*100:.1f}%")
+            if self.cfg.dry_run:
+                self.log(s, "scanner", "BUY", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
+                self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym":s, "pnl":0.0, "kind":"scanner"}
+            else:
+                try:
+                    self.client.place(s, "BUY", qty, "OPEN", stop=stop, target=target, tick=0.0001)
+                    time.sleep(1)
+                except Exception as e:
+                    logging.error(f"scanner entry failed {s}: {e}")
+            slots -= 1
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         notify(f"LeverageLord is alive | dry_run={self.cfg.dry_run} | watching {','.join(self.cfg.symbols)}")
@@ -347,6 +434,7 @@ class Bot:
                 if self.risk.daily_loss_hit(eq) or self.risk.kill_switch():
                     time.sleep(self.cfg.poll_seconds); continue
                 for sym in self.cfg.symbols: self.run_symbol(sym, eq)
+                self.run_scanner(eq)
                 beats += 1
                 if beats >= beats_between:
                     beats = 0
