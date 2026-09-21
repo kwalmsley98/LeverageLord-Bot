@@ -108,6 +108,7 @@ class BitunixClient:
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
     def equity_usdt(self):
+        global _LAST_EQ
         acct = None; used = "?"; errs = []
         for path in ["/api/v1/futures/account",              # CONFIRMED via Bitunix official docs
                      "/api/v1/futures/account/assets"]:
@@ -119,8 +120,7 @@ class BitunixClient:
                 errs.append(f"{path} => {e}")
         if acct is None:
             logging.warning("ACCOUNT FAIL | " + " || ".join(errs)[:500])
-            global _LAST_EQ
-            if _LAST_EQ:
+            if _LAST_EQ is not None:
                 logging.info(f"using cached equity {_LAST_EQ}")
                 return _LAST_EQ
             raise RuntimeError("account unreachable: " + " ;; ".join(errs)[:250])
@@ -135,9 +135,9 @@ class BitunixClient:
                     return float(a[k])
             return 0.0
         eq = f("available","availableVol","availableBalance") + f("margin","positionMargin") + f("crossUnrealizedPNL") + f("isolationUnrealizedPNL")
-        global _LAST_EQ
         _LAST_EQ = eq
         return eq
+
     def positions(self, symbol=None):
         params = {"symbol": symbol} if symbol else {}
         rows = None
