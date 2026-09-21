@@ -84,16 +84,23 @@ def fmt_px(p, tick=0.01):
 class BitunixClient:
     def __init__(self, key, secret):
         self.key, self.secret, self.s = key, secret, requests.Session()
-    def _sign(self, method, path, body_str):
+    def _sign(self, method, path, body_str, params=None):
         nonce = os.urandom(16).hex(); ts = str(int(time.time()*1000))
-        inner = hashlib.sha256((nonce+ts+self.key+""+body_str).encode()).hexdigest()
+        # Bitunix official spec (api-docs/futures/common/sign.html):
+        # digest = SHA256(nonce + timestamp + api-key + queryParams + body)
+        # queryParams = keys sorted ascending, concatenated as key+value, no separators
+        qp = ""
+        if params:
+            for k, v in sorted(params.items()):
+                qp += f"{k}{v}"
+        inner = hashlib.sha256((nonce+ts+self.key+qp+body_str).encode()).hexdigest()
         return {"api-key": self.key, "nonce": nonce, "timestamp": ts,
                 "sign": hashlib.sha256((inner+self.secret).encode()).hexdigest(),
                 "language": "en-US", "Content-Type": "application/json"}
     def _req(self, method, path, params=None, payload=None):
         body_str = json.dumps(payload, separators=(",",":")) if payload else ""
         r = self.s.request(method, BASE+path, params=params, data=body_str or None,
-                           headers=self._sign(method, path, body_str), timeout=15)
+                           headers=self._sign(method, path, body_str, params), timeout=15)
         try:
             data = r.json()
         except Exception:
