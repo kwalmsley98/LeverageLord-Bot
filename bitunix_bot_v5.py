@@ -32,16 +32,16 @@ class Config:
                                                       "BTCUSDT": ["donchian"],
                                                       "DOTUSDT": ["donchian"],      # scanner sleeve - validated 2 windows
                                                       "NEARUSDT": ["ignition"]})    # scanner sleeve - validated 2 windows
-    risk_map: dict = field(default_factory=lambda: {"ETHUSDT": 0.030, "SOLUSDT": 0.030,   # user request: target ~5%/mo
-                                                      "BNBUSDT": 0.015, "BTCUSDT": 0.010,
-                                                      "DOTUSDT": 0.015, "NEARUSDT": 0.015})
-    max_open_risk: float = 0.06
+    risk_map: dict = field(default_factory=lambda: {"ETHUSDT": 0.035, "SOLUSDT": 0.035,   # ceiling config - max survivable aggression
+                                                      "BNBUSDT": 0.0175, "BTCUSDT": 0.010,
+                                                      "DOTUSDT": 0.0175, "NEARUSDT": 0.0175})
+    max_open_risk: float = 0.07
     scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
     scanner_min_vol24: float = 20_000_000.0   # 24h volume floor (USDT) - protects thin-coin slippage
     scanner_max_pairs: int = 40      # cap on universe size per scan
     scanner_pairs: list = field(default_factory=lambda: ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
                                                           "DOGEUSDT","LINKUSDT","ADAUSDT","LTCUSDT","ARBUSDT","OPUSDT"])
-    scanner_risk: float = 0.010      # per top-gainer trade (validated two windows)
+    scanner_risk: float = 0.0125     # per top-gainer trade (validated two windows)
     scanner_max: int = 2             # max concurrent scanner positions
     scanner_ret: float = 0.04        # min 24-bar gain to qualify
     entry_limit: bool = True        # lever 1: maker-limit entries (free ~+0.5-1%/mo)
