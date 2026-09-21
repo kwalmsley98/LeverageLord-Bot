@@ -62,6 +62,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
     handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()])
 
 _ACCT_DEBUGGED = False
+_LAST_EQ = None
 _TG_TOKEN = os.getenv("TG_TOKEN", "")
 _TG_CHAT = os.getenv("TG_CHAT", "")
 def notify(msg):
@@ -93,8 +94,12 @@ class BitunixClient:
         body_str = json.dumps(payload, separators=(",",":")) if payload else ""
         r = self.s.request(method, BASE+path, params=params, data=body_str or None,
                            headers=self._sign(method, path, body_str), timeout=15)
-        data = r.json()
-        if data.get("code") != 0: raise RuntimeError(f"{path} -> {data}")
+        try:
+            data = r.json()
+        except Exception:
+            raise RuntimeError(f"{path} HTTP {r.status_code}: {r.text[:200]}")
+        if data.get("code") != 0:
+            raise RuntimeError(f"{path} -> code {data.get('code')}: {data.get('msg')}")
         return data.get("data")
     def klines(self, symbol, interval, limit=200):
         rows = self._req("GET", "/api/v1/futures/market/kline",
@@ -103,17 +108,22 @@ class BitunixClient:
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
     def equity_usdt(self):
-        acct = None; used = "?"
-        for path in ["/api/v1/futures/account",              # CONFIRMED: Bitunix "Get Single Account"
+        acct = None; used = "?"; errs = []
+        for path in ["/api/v1/futures/account",              # CONFIRMED via Bitunix official docs
                      "/api/v1/futures/account/assets"]:
             try:
                 acct = self._req("GET", path, {"marginCoin": "USDT"})
                 if acct is not None:
                     used = path; break
-            except Exception:
-                continue
+            except Exception as e:
+                errs.append(f"{path} => {e}")
         if acct is None:
-            raise RuntimeError("account endpoint unreachable (all paths 404)")
+            logging.warning("ACCOUNT FAIL | " + " || ".join(errs)[:500])
+            global _LAST_EQ
+            if _LAST_EQ:
+                logging.info(f"using cached equity {_LAST_EQ}")
+                return _LAST_EQ
+            raise RuntimeError("account unreachable: " + " ;; ".join(errs)[:250])
         a = acct[0] if isinstance(acct, list) and acct else (acct if isinstance(acct, dict) else {})
         global _ACCT_DEBUGGED
         if not _ACCT_DEBUGGED:
@@ -124,7 +134,10 @@ class BitunixClient:
                 if k in a and a[k] not in (None, ""):
                     return float(a[k])
             return 0.0
-        return f("available","availableVol","availableBalance") + f("margin","positionMargin") + f("crossUnrealizedPNL") + f("isolationUnrealizedPNL")
+        eq = f("available","availableVol","availableBalance") + f("margin","positionMargin") + f("crossUnrealizedPNL") + f("isolationUnrealizedPNL")
+        global _LAST_EQ
+        _LAST_EQ = eq
+        return eq
     def positions(self, symbol=None):
         params = {"symbol": symbol} if symbol else {}
         rows = None
