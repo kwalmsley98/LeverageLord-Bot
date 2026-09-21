@@ -51,7 +51,7 @@ class Config:
     daily_loss_limit: float = 0.05
     kill_min_trades: int = 40           # lower: candidate edge needs faster verdicts
     kill_wr_buffer: float = 0.02
-    poll_seconds: int = 30
+    poll_seconds: int = field(default_factory=lambda: int(os.getenv("POLL_SECONDS", "60")))
     dry_run: bool = True
     dry_equity: float = 10_000.0
     tg_token: str = field(default_factory=lambda: os.getenv("TG_TOKEN", ""))   # Telegram bot token from @BotFather
