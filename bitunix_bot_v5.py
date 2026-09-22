@@ -239,6 +239,7 @@ class Bot:
         self.seen_bar = {s: 0 for s in cfg.symbols}
         self.open_pos = {}; self.entry_info = {}
         self.scan_seen_bar = 0
+        self.tg_offset = 0
         self.last_scan = {"top": [], "universe": 0, "signals": 0}
         self.eq_hist = []
         self.day_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -261,10 +262,12 @@ class Bot:
                     except Exception:
                         R = None
                 if R is None: R = 1.0 if info["pnl"]>0 else -1.0
-                self.risk.record_trade(R>0)
+                if info.get("kind") != "test":
+                    self.risk.record_trade(R>0)
                 wins = sum(self.risk.trades); n = len(self.risk.trades)
                 wr = f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "0/0"
-                e = "🟢" if R>0 else "🔴"; w = "WIN ✅" if R>0 else "LOSS ❌"
+                e = "🧪" if info.get("kind")=="test" else ("🟢" if R>0 else "🔴")
+                w = "TEST CLOSED" if info.get("kind")=="test" else ("WIN ✅" if R>0 else "LOSS ❌")
                 self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R","tp/sl/external")
                 notify(f"{e} <b>{info['sym']} CLOSED · {w}</b>\n"
                        f"💰 Result: <b>{R:+.2f}R</b>\n🏆 Record: {wr}")
@@ -463,6 +466,56 @@ class Bot:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
 
+
+    def poll_commands(self):
+        if not (_TG_TOKEN and _TG_CHAT): return
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{_TG_TOKEN}/getUpdates",
+                             params={"offset": self.tg_offset, "timeout": 0}, timeout=10).json()
+            for u in r.get("result", []):
+                self.tg_offset = u["update_id"] + 1
+                msg = u.get("message", {})
+                if str(msg.get("chat", {}).get("id")) != str(_TG_CHAT): continue
+                text = (msg.get("text") or "").strip().lower()
+                if text == "/test": self.test_trade()
+                elif text == "/status": self.status_report()
+        except Exception:
+            pass
+
+    def status_report(self):
+        eq = self.equity()
+        wins = sum(self.risk.trades); n = len(self.risk.trades)
+        wr = f"{wins/n*100:.0f}%" if n else "n/a"
+        pos = "\n".join(f"• {i['sym']} (risk {i.get('risk','?')})" for i in self.entry_info.values()) or "none"
+        top3 = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for s, g in self.last_scan.get("top", [])[:3]) or "awaiting first scan"
+        notify(f"📊 <b>STATUS</b>\n🏦 Equity ${eq:.2f}\n📂 Open: {pos}\n📝 Trades: {n} (WR {wr})\n🔎 Market: {top3}\n🛑 Halted: {self.risk.halted_today or self.risk.killed}")
+
+    def test_trade(self):
+        notify("🧪 <b>TEST</b>: firing tiny BTC order to prove the full pipeline...")
+        try:
+            rows = self.client.klines("BTCUSDT", self.cfg.interval, 50)
+            if len(rows) < 20: raise RuntimeError("no kline data")
+            price = rows[-1]["c"]
+            trs = [max(rows[i]["h"]-rows[i]["l"], abs(rows[i]["h"]-rows[i-1]["c"]), abs(rows[i]["l"]-rows[i-1]["c"]))
+                   for i in range(-14, 0)]
+            atrv = sum(trs)/len(trs)
+            eq = self.equity()
+            notional = max(12.0, min(25.0, eq*0.25))     # $12-25 - tiny
+            qty = notional/price
+            stop = price - 0.6*atrv; target = price + 0.9*atrv
+            self.client.place("BTCUSDT", "BUY", qty, "OPEN", stop=stop, target=target)
+            time.sleep(1); self.sync()
+            found = False
+            for pid, info in self.open_pos.items():
+                if info["sym"] == "BTCUSDT" and "entry" not in info:
+                    info.update({"entry": price, "stop": stop, "side": 1, "kind": "test"}); found = True
+            logging.info(f"TEST TRADE fired BTC qty={fmt_qty(qty)} stop={stop:.1f} target={target:.1f}")
+            notify(f"🧪 <b>TEST ENTER BTC</b>\n📍 {price:.1f} · 🛑 {stop:.1f} · 🎯 {target:.1f}\n"
+                   f"💵 Notional ${notional:.0f} (tiny)\n⏳ You'll get a CLOSED message when TP/SL resolves - pipeline proven.")
+        except Exception as e:
+            logging.error(f"test trade failed: {e}")
+            notify(f"🧪 TEST FAILED: {e}")
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         mode = "🔴 LIVE (real money)" if not self.cfg.dry_run else "🟡 DRY-RUN (paper)"
@@ -509,6 +562,7 @@ class Bot:
                     notify(f"💓 Equity <b>${eq:.2f}</b> · {len(self.open_pos)} open · {n} trades (WR {wr}) · {status}\n"
                            f"🔎 Market: {top3}\n"
                            f"📈 {sparkline(self.eq_hist)}")
+                self.poll_commands()
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
                 logging.error(f"loop error: {ex}"); time.sleep(60)
