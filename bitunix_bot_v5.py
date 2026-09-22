@@ -315,11 +315,11 @@ class Bot:
     def run_symbol(self, sym, equity):
         rows = self.client.klines(sym, self.cfg.interval, 200)
         if len(rows) < self.cfg.ema_trend+5: return
-        bar = rows[-1]
-        if time.time()*1000 < bar["t"]+INTERVAL_MS[self.cfg.interval]: return
-        if bar["t"]==self.seen_bar[sym]: return
-        self.seen_bar[sym]=bar["t"]
-        sig, kind, atrv = self.detect_signal(sym, rows)
+        bar = rows[-2]                                   # last CLOSED bar
+        win = rows[-1]["t"]                              # forming bar open == signal bar close time
+        if win==self.seen_bar[sym]: return
+        self.seen_bar[sym]=win
+        sig, kind, atrv = self.detect_signal(sym, rows[:-1])
         if sig!=0 and sig!=self.state[sym]:
             self._flip(sym, sig, kind, rows, atrv, equity)
 
@@ -358,8 +358,8 @@ class Bot:
                 res = self.client.place(sym, side, qty, "OPEN", order_type="LIMIT", price=lim,
                                         stop=stop, target=target)
                 oid = (res or {}).get("orderId") or (res or {}).get("id")
-                for _ in range(self.cfg.entry_timeout_bars):
-                    time.sleep(INTERVAL_MS[self.cfg.interval]/1000/2)
+                for _ in range(self.cfg.entry_timeout_bars*60):
+                    time.sleep(60)
                     self.sync()
                     if any(i["sym"]==sym for i in self.open_pos.values()):
                         filled = True; logging.info(f"{sym}: limit filled at maker fee"); break
@@ -385,10 +385,9 @@ class Bot:
         """Top-gainer cross-sectional momentum sleeve. Validated on two windows
         (crash: 72 tr +22.9%, bull: 87 tr +52.9% at 1.5% risk)."""
         now_ms = time.time()*1000
-        bar = (int(now_ms)//INTERVAL_MS[self.cfg.interval])*INTERVAL_MS[self.cfg.interval]
-        if now_ms < bar + INTERVAL_MS[self.cfg.interval]: return      # bar not closed yet
-        if bar == self.scan_seen_bar: return
-        self.scan_seen_bar = bar
+        win = (int(now_ms)//INTERVAL_MS[self.cfg.interval])*INTERVAL_MS[self.cfg.interval]   # just-closed bar's boundary
+        if win == self.scan_seen_bar: return
+        self.scan_seen_bar = win
         universe = list(self.cfg.scanner_pairs)
         if self.cfg.scanner_dynamic:
             try:
@@ -404,7 +403,7 @@ class Bot:
         for s in universe:
             try:
                 rows = self.client.klines(s, self.cfg.interval, 100)
-                if len(rows) >= 30: data[s] = rows
+                if len(rows) >= 30: data[s] = rows[:-1]      # drop forming bar - closed bars only
             except Exception:
                 continue
         if not data: return
