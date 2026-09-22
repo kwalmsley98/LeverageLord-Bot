@@ -81,9 +81,18 @@ def notify(msg):
     if not (_TG_TOKEN and _TG_CHAT): return
     try:
         requests.post(f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
-                      data={"chat_id": _TG_CHAT, "text": msg}, timeout=10)
+                      data={"chat_id": _TG_CHAT, "text": msg, "parse_mode": "HTML",
+                            "disable_web_page_preview": True}, timeout=10)
     except Exception:
         pass
+
+def sparkline(vals, width=24):
+    if not vals: return ""
+    vals = vals[-width:]
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-12: return "▁"*len(vals)
+    bars = "▁▂▃▄▅▆▇█"
+    return "".join(bars[min(int((v-lo)/(hi-lo)*7.999), 7)] for v in vals)
 
 def fmt_qty(q):
     s = f"{q:.6f}".rstrip("0").rstrip(".")
@@ -229,6 +238,9 @@ class Bot:
         self.seen_bar = {s: 0 for s in cfg.symbols}
         self.open_pos = {}; self.entry_info = {}
         self.scan_seen_bar = 0
+        self.eq_hist = []
+        self.day_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.day_start_eq = None
         self.csv = open("trades.csv","a",newline="")
         self.writer = csv.writer(self.csv)
         if self.csv.tell()==0:
@@ -239,8 +251,21 @@ class Bot:
         live={p["id"]:p for p in self.client.positions()}
         for pid,info in list(self.open_pos.items()):
             if pid not in live:
-                self.risk.record_trade(info["pnl"]); self.log(info["sym"],"CLOSED","","","","","",f"{info['pnl']:+.4f}","tp/sl/external")
-                notify(f"{info['sym']} CLOSED | pnl {info['pnl']*100:+.1f}% of risk | trades logged: {len(self.risk.trades)}")
+                R = None
+                if info.get("entry") and info.get("stop"):
+                    try:
+                        mk = self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
+                        R = (mk-info["entry"])/abs(info["entry"]-info["stop"])*info.get("side",1)
+                    except Exception:
+                        R = None
+                if R is None: R = 1.0 if info["pnl"]>0 else -1.0
+                self.risk.record_trade(R>0)
+                wins = sum(self.risk.trades); n = len(self.risk.trades)
+                wr = f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "0/0"
+                e = "🟢" if R>0 else "🔴"; w = "WIN ✅" if R>0 else "LOSS ❌"
+                self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R","tp/sl/external")
+                notify(f"{e} <b>{info['sym']} CLOSED · {w}</b>\n"
+                       f"💰 Result: <b>{R:+.2f}R</b>\n🏆 Record: {wr}")
                 self.state[info["sym"]]=0; self.entry_info.pop(info["sym"],None); del self.open_pos[pid]
         for pid,p in live.items():
             if pid not in self.open_pos:
@@ -318,7 +343,10 @@ class Bot:
         qty = min(risk/rd, self.cfg.max_notional_lev)*equity/price
         side = "BUY" if new_side>0 else "SELL"
         logging.info(f"{sym}: ENTER {kind} {side} qty={fmt_qty(qty)} stop={stop:.2f} tgt={target:.2f}")
-        notify(f"ENTER {sym} {kind} {side} | stop {stop:.2f} target {target:.2f} | risk {risk*100:.2f}%")
+        d = "🟢 LONG" if new_side>0 else "🔴 SHORT"
+        notify(f"{d} <b>{sym}</b> · {kind.upper()}\n"
+               f"📍 Entry {price:.4f}\n🛑 Stop {stop:.4f} · 🎯 Target {target:.4f}\n"
+               f"📊 Risk {risk*100:.2f}% · notional ~${qty*price:.0f}")
         if self.cfg.dry_run:
             self.log(sym, kind, side, fmt_qty(qty), f"{stop:.2f}", f"{target:.2f}", "", "DRY_RUN")
             self.open_pos[f"dry-{sym}-{int(time.time()*1000)}"]={"sym":sym,"pnl":0.0}
@@ -345,8 +373,11 @@ class Bot:
                 filled = any(i["sym"]==sym for i in self.open_pos.values())
             if not filled and not self.cfg.entry_limit:
                 logging.error(f"{sym}: entry unconfirmed — not tracked"); return
+        for _pid,_info in self.open_pos.items():
+            if _info["sym"]==sym and "entry" not in _info:
+                _info.update({"entry":price,"stop":stop,"side":new_side,"kind":kind})
         self.state[sym]=new_side
-        self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd}
+        self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd,"stop":stop,"side":new_side}
 
 
     def run_scanner(self, equity):
@@ -405,14 +436,19 @@ class Bot:
             qty = min(qty, 5.0*equity/price)
             if qty*price < 10: continue
             logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
-            notify(f"SCANNER ENTER {s} | top gainer +{ret24*100:.1f}%/24h | stop {stop:.4f} target {target:.4f} | risk {self.cfg.scanner_risk*100:.1f}%")
+            notify(f"🚀 <b>SCANNER · {s}</b> 🔥 top gainer +{ret24*100:.1f}%/24h\n"
+                   f"📍 Entry ~{price:.4f}\n🛑 {stop:.4f} · 🎯 {target:.4f}\n"
+                   f"📊 Risk {self.cfg.scanner_risk*100:.1f}%")
             if self.cfg.dry_run:
                 self.log(s, "scanner", "BUY", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
                 self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym":s, "pnl":0.0, "kind":"scanner"}
             else:
                 try:
                     self.client.place(s, "BUY", qty, "OPEN", stop=stop, target=target, tick=0.0001)
-                    time.sleep(1)
+                    time.sleep(1); self.sync()
+                    for _pid,_info in self.open_pos.items():
+                        if _info["sym"]==s and "entry" not in _info:
+                            _info.update({"entry":price,"stop":stop,"side":1,"kind":"scanner"})
                 except Exception as e:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
@@ -440,7 +476,19 @@ class Bot:
                     beats = 0
                     wins = sum(self.risk.trades); n = len(self.risk.trades)
                     wr = f"{wins/n*100:.0f}%" if n else "n/a"
-                    notify(f"Heartbeat | equity ${eq:.2f} | open pos {len(self.open_pos)} | trades {n} (WR {wr}) | halted={self.risk.halted_today or self.risk.killed}")
+                    self.eq_hist.append(eq); self.eq_hist = self.eq_hist[-168:]
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    if today != self.day_stamp:
+                        self.day_stamp = today
+                        base = self.day_start_eq or eq
+                        chg = (eq/base-1)*100 if base else 0
+                        c = "🟢" if chg>=0 else "🔴"
+                        notify(f"📅 <b>DAILY SUMMARY · {today}</b>\n"
+                               f"🏦 Equity ${eq:.2f} ({c}{chg:+.1f}% today)\n"
+                               f"📝 Trades: {n} · 🏆 WR {wr}\n"
+                               f"📈 {sparkline(self.eq_hist)}")
+                    notify(f"💓 Equity <b>${eq:.2f}</b> · {len(self.open_pos)} open · {n} trades (WR {wr}) · {status}\n"
+                           f"📈 {sparkline(self.eq_hist)}")
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
                 logging.error(f"loop error: {ex}"); time.sleep(60)
