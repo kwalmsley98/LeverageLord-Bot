@@ -36,6 +36,8 @@ class Config:
                                                       "BNBUSDT": 0.0175, "BTCUSDT": 0.010,
                                                       "DOTUSDT": 0.0175, "NEARUSDT": 0.0175})
     max_open_risk: float = 0.07
+    min_qty_map: dict = field(default_factory=lambda: {"BTCUSDT": 0.001})
+    min_notional_usdt: float = 15.0
     scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
     scanner_min_vol24: float = 10_000_000.0   # 24h volume floor (Bitunix-native vol) - 1000PEPE/WIF qualify, 1-7M shrapnel excluded
     scanner_max_pairs: int = 40      # cap on universe size per scan
@@ -368,6 +370,7 @@ class Bot:
         if sum(i.get("risk",0) for i in self.entry_info.values()) + risk > self.cfg.max_open_risk:
             logging.info(f"{sym}: skipped, open-risk cap reached"); return
         qty = min(risk/rd, self.cfg.max_notional_lev)*equity/price
+        qty = max(qty, self.cfg.min_qty_map.get(sym, 0), self.cfg.min_notional_usdt/price)
         side = "BUY" if new_side>0 else "SELL"
         logging.info(f"{sym}: ENTER {kind} {side} qty={fmt_qty(qty)} stop={stop:.2f} tgt={target:.2f}")
         d = "🟢 LONG" if new_side>0 else "🔴 SHORT"
@@ -381,8 +384,8 @@ class Bot:
             filled = False
             if self.cfg.entry_limit:
                 lim = price*(1-self.cfg.limit_offset) if new_side>0 else price*(1+self.cfg.limit_offset)
-                res = self.client.place(sym, side, qty, "OPEN", order_type="LIMIT", price=lim,
-                                        stop=stop, target=target)
+                _mode, res = self.client.place(sym, side, qty, "OPEN", order_type="LIMIT", price=lim,
+                                               stop=stop, target=target)
                 oid = (res or {}).get("orderId") or (res or {}).get("id")
                 for _ in range(self.cfg.entry_timeout_bars*60):
                     time.sleep(60)
@@ -468,6 +471,7 @@ class Bot:
             stop = price - atr; target = price + self.cfg.tp_r*atr
             qty = (self.cfg.scanner_risk/rd)*equity/price
             qty = min(qty, 5.0*equity/price)
+            qty = max(qty, self.cfg.min_qty_map.get(s, 0), self.cfg.min_notional_usdt/price)
             if qty*price < 10: continue
             self.last_scan["signals"] += 1
             logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
@@ -499,7 +503,9 @@ class Bot:
                 msg = u.get("message", {})
                 if str(msg.get("chat", {}).get("id")) != str(_TG_CHAT): continue
                 text = (msg.get("text") or "").strip().lower()
-                if text == "/test": self.test_trade()
+                if text.startswith("/test"):
+                    parts = text.split()
+                    self.test_trade(parts[1].upper() if len(parts) > 1 else "BTCUSDT")
                 elif text == "/status": self.status_report()
         except Exception:
             pass
@@ -512,10 +518,10 @@ class Bot:
         top3 = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for s, g in self.last_scan.get("top", [])[:3]) or "awaiting first scan"
         notify(f"📊 <b>STATUS</b>\n🏦 Equity ${eq:.2f}\n📂 Open: {pos}\n📝 Trades: {n} (WR {wr})\n🔎 Market: {top3}\n🛑 Halted: {self.risk.halted_today or self.risk.killed}")
 
-    def test_trade(self):
+    def test_trade(self, sym="BTCUSDT"):
         notify("🧪 <b>TEST</b>: firing tiny BTC order to prove the full pipeline...")
         try:
-            rows = self.client.klines("BTCUSDT", self.cfg.interval, 50)
+            rows = self.client.klines(sym, self.cfg.interval, 50)
             if len(rows) < 20: raise RuntimeError("no kline data")
             price = rows[-1]["c"]
             trs = [max(rows[i]["h"]-rows[i]["l"], abs(rows[i]["h"]-rows[i-1]["c"]), abs(rows[i]["l"]-rows[i-1]["c"]))
@@ -523,17 +529,18 @@ class Bot:
             atrv = sum(trs)/len(trs)
             eq = self.equity()
             notional = max(12.0, min(25.0, eq*0.25))     # $12-25 - tiny
-            qty = max(notional/price, 0.001)             # Bitunix BTC min order = 0.001 BTC
+            qty = max(notional/price, self.cfg.min_qty_map.get(sym, 0), self.cfg.min_notional_usdt/price)
             notional = qty*price
             stop = price - 0.6*atrv; target = price + 0.9*atrv
-            self.client.place("BTCUSDT", "BUY", qty, "OPEN", stop=stop, target=target)
+            tick = 0.0001 if price < 10 else 0.1
+            self.client.place(sym, "BUY", qty, "OPEN", stop=stop, target=target, tick=tick)
             time.sleep(1); self.sync()
             found = False
             for pid, info in self.open_pos.items():
-                if info["sym"] == "BTCUSDT" and "entry" not in info:
+                if info["sym"] == sym and "entry" not in info:
                     info.update({"entry": price, "stop": stop, "side": 1, "kind": "test"}); found = True
-            logging.info(f"TEST TRADE fired BTC qty={fmt_qty(qty)} stop={stop:.1f} target={target:.1f}")
-            notify(f"🧪 <b>TEST ENTER BTC</b>\n📍 {price:.1f} · 🛑 {stop:.1f} · 🎯 {target:.1f}\n"
+            logging.info(f"TEST TRADE fired {sym} qty={fmt_qty(qty)} stop={stop:.1f} target={target:.1f}")
+            notify(f"🧪 <b>TEST ENTER {sym}</b>\n📍 {price:.4f} · 🛑 {stop:.4f} · 🎯 {target:.4f}\n"
                    f"💵 Notional ${notional:.0f} (tiny)\n⏳ You'll get a CLOSED message when TP/SL resolves - pipeline proven.")
         except Exception as e:
             logging.error(f"test trade failed: {e}")
