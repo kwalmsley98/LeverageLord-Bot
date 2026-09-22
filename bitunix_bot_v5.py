@@ -200,9 +200,10 @@ class BitunixClient:
             except Exception:
                 continue
     def place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
-              stop=None, target=None, tick=0.01):
+              stop=None, target=None, tick=0.1):
         payload={"symbol":symbol,"side":side,"qty":fmt_qty(qty),"tradeSide":trade_side,
-                 "orderType":order_type,"effect":"GTC","clientId":f"botv5-{int(time.time()*1000)}"}
+                 "orderType":order_type,"effect":"GTC","clientId":str(int(time.time()*1000)),
+                 "reduceOnly": trade_side=="CLOSE"}
         if order_type=="LIMIT": payload["price"]=fmt_px(price,tick)
         if trade_side=="OPEN" and stop and target:
             payload.update({"tpPrice":fmt_px(target,tick),"tpStopType":"MARK_PRICE","tpOrderType":"MARKET",
