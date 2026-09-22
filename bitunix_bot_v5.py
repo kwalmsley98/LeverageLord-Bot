@@ -206,6 +206,15 @@ class BitunixClient:
                  "reduceOnly": trade_side=="CLOSE"}
         if order_type=="LIMIT": payload["price"]=fmt_px(price,tick)
         if trade_side=="OPEN" and stop and target:
+            try:   # clamp bracket against a FRESH mark price - fast markets can invalidate it
+                mk = self.klines(symbol, self.cfg.interval, 1)[-1]["c"]
+                if side == "BUY":
+                    target = max(target, mk*1.002); stop = min(stop, mk*0.998)
+                else:
+                    target = min(target, mk*0.998); stop = max(stop, mk*1.002)
+            except Exception:
+                pass
+        if trade_side=="OPEN" and stop and target:
             payload.update({"tpPrice":fmt_px(target,tick),"tpStopType":"MARK_PRICE","tpOrderType":"MARKET",
                             "slPrice":fmt_px(stop,tick),"slStopType":"MARK_PRICE","slOrderType":"MARKET"})
         logging.info(f"ORDER payload: {payload}")
