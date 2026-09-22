@@ -76,6 +76,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
     handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()])
 
 _ACCT_DEBUGGED = False
+_TK_DEBUGGED = False
 _LAST_EQ = None
 _TG_TOKEN = os.getenv("TG_TOKEN", "")
 _TG_CHAT = os.getenv("TG_CHAT", "")
@@ -137,14 +138,27 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
-    def tickers(self):   # VERIFY field names - Bitunix 'Get All Tickers'
+    def tickers(self):   # Bitunix 'Get All Tickers' (confirmed path)
         rows = self._req("GET", "/api/v1/futures/market/tickers") or []
+        global _TK_DEBUGGED
+        if not _TK_DEBUGGED and rows:
+            _TK_DEBUGGED = True
+            logging.info(f"TICKERS RAW sample: {json.dumps(rows[0])[:400]} | count: {len(rows)}")
         out = []
         for t in rows:
             sym = t.get("symbol", "")
-            vol = float(t.get("vol") or t.get("volume") or t.get("turnover") or t.get("amount") or 0)
+            vol = float(t.get("vol") or t.get("volume") or t.get("vol24h") or t.get("turnover") or t.get("amount") or t.get("quoteVol") or 0)
             out.append({"symbol": sym, "vol24": vol})
         return out
+
+    def valid_symbols(self):
+        try:
+            syms = {t["symbol"] for t in self.tickers() if t.get("symbol")}
+            if syms: logging.info(f"valid futures symbols: {len(syms)} listed")
+            return syms
+        except Exception as e:
+            logging.warning(f"symbol discovery failed: {e} - allowing configured names")
+            return None
 
     def equity_usdt(self):
         global _LAST_EQ
@@ -519,7 +533,11 @@ class Bot:
         notify(f"📊 <b>STATUS</b>\n🏦 Equity ${eq:.2f}\n📂 Open: {pos}\n📝 Trades: {n} (WR {wr})\n🔎 Market: {top3}\n🛑 Halted: {self.risk.halted_today or self.risk.killed}")
 
     def test_trade(self, sym="BTCUSDT"):
-        notify("🧪 <b>TEST</b>: firing tiny BTC order to prove the full pipeline...")
+        valid = self.client.valid_symbols()
+        if valid and sym not in valid:
+            notify(f"⚠️ <b>{sym}</b> is not a listed Bitunix future. Check the Futures tab for the exact name.")
+            return
+        notify(f"🧪 <b>TEST</b>: firing tiny {sym} order to prove the full pipeline...")
         try:
             rows = self.client.klines(sym, self.cfg.interval, 50)
             if len(rows) < 20: raise RuntimeError("no kline data")
@@ -586,6 +604,18 @@ class Bot:
 
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
+        valid = None if self.cfg.dry_run else self.client.valid_symbols()
+        if valid:
+            bad = [s for s in self.cfg.symbols if s not in valid]
+            if bad:
+                logging.warning(f"NOT LISTED on Bitunix futures, removing: {bad}")
+                notify(f"⚠️ Not listed on Bitunix futures, removed: {', '.join(bad)}")
+                self.cfg.symbols = [s for s in self.cfg.symbols if s in valid]
+            bad_sc = [s for s in self.cfg.scanner_pairs if s not in valid]
+            if bad_sc:
+                logging.warning(f"scanner pairs not listed, removing: {bad_sc}")
+                self.cfg.scanner_pairs = [s for s in self.cfg.scanner_pairs if s in valid]
+            self.state = {s: 0 for s in self.cfg.symbols}
         mode = "🔴 LIVE (real money)" if not self.cfg.dry_run else "🟡 DRY-RUN (paper)"
         notify(f"🤖 <b>LEVERAGELORD ONLINE</b>\n"
                f"⚙️ Mode: {mode}\n"
