@@ -207,6 +207,7 @@ class BitunixClient:
         if trade_side=="OPEN" and stop and target:
             payload.update({"tpPrice":fmt_px(target,tick),"tpStopType":"MARK_PRICE","tpOrderType":"MARKET",
                             "slPrice":fmt_px(stop,tick),"slStopType":"MARK_PRICE","slOrderType":"MARKET"})
+        logging.info(f"ORDER payload: {payload}")
         return self._req("POST", "/api/v1/futures/trade/place_order", payload=payload)
 
 class RiskManager:
@@ -501,7 +502,8 @@ class Bot:
             atrv = sum(trs)/len(trs)
             eq = self.equity()
             notional = max(12.0, min(25.0, eq*0.25))     # $12-25 - tiny
-            qty = notional/price
+            qty = max(notional/price, 0.001)             # Bitunix BTC min order = 0.001 BTC
+            notional = qty*price
             stop = price - 0.6*atrv; target = price + 0.9*atrv
             self.client.place("BTCUSDT", "BUY", qty, "OPEN", stop=stop, target=target)
             time.sleep(1); self.sync()
