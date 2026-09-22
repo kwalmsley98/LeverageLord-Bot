@@ -37,10 +37,11 @@ class Config:
                                                       "DOTUSDT": 0.0175, "NEARUSDT": 0.0175})
     max_open_risk: float = 0.07
     scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
-    scanner_min_vol24: float = 20_000_000.0   # 24h volume floor (USDT) - protects thin-coin slippage
+    scanner_min_vol24: float = 10_000_000.0   # 24h volume floor (Bitunix-native vol) - 1000PEPE/WIF qualify, 1-7M shrapnel excluded
     scanner_max_pairs: int = 40      # cap on universe size per scan
     scanner_pairs: list = field(default_factory=lambda: ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
-                                                          "DOGEUSDT","LINKUSDT","ADAUSDT","LTCUSDT","ARBUSDT","OPUSDT"])
+                                                          "DOGEUSDT","LINKUSDT","ADAUSDT","LTCUSDT","ARBUSDT","OPUSDT",
+                                                          "1000PEPEUSDT","WIFUSDT","FLOKIUSDT","1000BONKUSDT","TAOUSDT"])
     scanner_risk: float = 0.0125     # per top-gainer trade (validated two windows)
     scanner_max: int = 2             # max concurrent scanner positions
     scanner_ret: float = 0.04        # min 24-bar gain to qualify
