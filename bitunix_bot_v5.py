@@ -455,7 +455,12 @@ class Bot:
 
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
-        notify(f"LeverageLord is alive | dry_run={self.cfg.dry_run} | watching {','.join(self.cfg.symbols)}")
+        mode = "🔴 LIVE (real money)" if not self.cfg.dry_run else "🟡 DRY-RUN (paper)"
+        notify(f"🤖 <b>LEVERAGELORD ONLINE</b>\n"
+               f"⚙️ Mode: {mode}\n"
+               f"👁 Watching {len(self.cfg.symbols)} core pairs + dynamic scanner\n"
+               f"🎯 Target ~5%/mo · verdict at 40 trades\n"
+               f"💓 Heartbeats hourly · kill switch armed")
         beats = 0
         beats_between = max(1, 3600 // max(self.cfg.poll_seconds, 1))   # ~1 per hour
         while True:
@@ -487,6 +492,8 @@ class Bot:
                                f"🏦 Equity ${eq:.2f} ({c}{chg:+.1f}% today)\n"
                                f"📝 Trades: {n} · 🏆 WR {wr}\n"
                                f"📈 {sparkline(self.eq_hist)}")
+                    self.day_start_eq = eq
+                    status = "✅ running" if not (self.risk.halted_today or self.risk.killed) else "⏸ halted"
                     notify(f"💓 Equity <b>${eq:.2f}</b> · {len(self.open_pos)} open · {n} trades (WR {wr}) · {status}\n"
                            f"📈 {sparkline(self.eq_hist)}")
                 time.sleep(self.cfg.poll_seconds)
