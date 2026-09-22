@@ -299,6 +299,10 @@ class Bot:
                         R = (mk-info["entry"])/abs(info["entry"]-info["stop"])*info.get("side",1)
                     except Exception:
                         R = None
+                if not (info.get("entry") and info.get("stop")):
+                    self.log(info["sym"],"CLOSED","","","","","","","external close (no entry data - not counted)")
+                    notify(f"⚪ <b>{info['sym']} closed externally</b> - not counted in the record (no entry data on adopted position)")
+                    self.state[info["sym"]] = 0; self.entry_info.pop(info["sym"], None); del self.open_pos[pid]; continue
                 if R is None: R = 1.0 if info["pnl"]>0 else -1.0
                 if info.get("kind") != "test":
                     self.risk.record_trade(R>0)
@@ -306,9 +310,10 @@ class Bot:
                 wr = f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "0/0"
                 e = "🧪" if info.get("kind")=="test" else ("🟢" if R>0 else "🔴")
                 w = "TEST CLOSED" if info.get("kind")=="test" else ("WIN ✅" if R>0 else "LOSS ❌")
-                self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R","tp/sl/external")
+                pct = R * info.get("risk_frac", 0.015) * 100
+                self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R ({pct:+.2f}%)","tp/sl/external")
                 notify(f"{e} <b>{info['sym']} CLOSED · {w}</b>\n"
-                       f"💰 Result: <b>{R:+.2f}R</b>\n🏆 Record: {wr}")
+                       f"💰 Result: <b>{pct:+.2f}%</b> ({R:+.2f}R)\n🏆 Record: {wr}")
                 self.state[info["sym"]]=0; self.entry_info.pop(info["sym"],None); del self.open_pos[pid]
         for pid,p in live.items():
             if pid not in self.open_pos:
@@ -419,7 +424,7 @@ class Bot:
                 logging.error(f"{sym}: entry unconfirmed — not tracked"); return
         for _pid,_info in self.open_pos.items():
             if _info["sym"]==sym and "entry" not in _info:
-                _info.update({"entry":price,"stop":stop,"target":target,"side":new_side,"kind":kind,"qty":qty})
+                _info.update({"entry":price,"stop":stop,"target":target,"side":new_side,"kind":kind,"qty":qty,"risk_frac":risk})
         self.state[sym]=new_side
         self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd,"stop":stop,"side":new_side}
 
@@ -501,7 +506,7 @@ class Bot:
                     time.sleep(1); self.sync()
                     for _pid,_info in self.open_pos.items():
                         if _info["sym"]==s and "entry" not in _info:
-                            _info.update({"entry":price,"stop":stop,"target":target,"side":1,"kind":"scanner","qty":qty})
+                            _info.update({"entry":price,"stop":stop,"target":target,"side":1,"kind":"scanner","qty":qty,"risk_frac":self.cfg.scanner_risk})
                 except Exception as e:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
@@ -519,8 +524,13 @@ class Bot:
                 text = (msg.get("text") or "").strip().lower()
                 if text.startswith("/test"):
                     parts = text.split()
-                    self.test_trade(parts[1].upper() if len(parts) > 1 else "BTCUSDT")
+                    sym = (parts[1].upper() if len(parts) > 1 else "BTCUSDT")
+                    if not sym.endswith("USDT"): sym += "USDT"
+                    self.test_trade(sym)
                 elif text == "/status": self.status_report()
+                elif text == "/reset":
+                    self.risk.trades = []
+                    notify("🔄 Trade record wiped - 0 trades, clean slate. (Deploys also reset it.)")
         except Exception:
             pass
 
@@ -556,7 +566,8 @@ class Bot:
             found = False
             for pid, info in self.open_pos.items():
                 if info["sym"] == sym and "entry" not in info:
-                    info.update({"entry": price, "stop": stop, "side": 1, "kind": "test"}); found = True
+                    rf = (abs(price-stop)/price*qty*price)/max(eq,1e-9)
+                    info.update({"entry": price, "stop": stop, "side": 1, "kind": "test", "target": target, "qty": qty, "risk_frac": rf}); found = True
             logging.info(f"TEST TRADE fired {sym} qty={fmt_qty(qty)} stop={stop:.1f} target={target:.1f}")
             notify(f"🧪 <b>TEST ENTER {sym}</b>\n📍 {price:.4f} · 🛑 {stop:.4f} · 🎯 {target:.4f}\n"
                    f"💵 Notional ${notional:.0f} (tiny)\n⏳ You'll get a CLOSED message when TP/SL resolves - pipeline proven.")
@@ -595,9 +606,10 @@ class Bot:
             wr = f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "0/0"
             e2 = "🧪" if info.get("kind")=="test" else ("🟢" if R>0 else "🔴")
             w2 = "TEST CLOSED" if info.get("kind")=="test" else ("WIN ✅" if R>0 else "LOSS ❌")
-            self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R","bot-managed exit")
+            pct = R * info.get("risk_frac", 0.015) * 100
+            self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R ({pct:+.2f}%)","bot-managed exit")
             notify(f"{e2} <b>{info['sym']} CLOSED · {w2}</b>\n"
-                   f"💰 Result: <b>{R:+.2f}R</b>\n🏆 Record: {wr}")
+                   f"💰 Result: <b>{pct:+.2f}%</b> ({R:+.2f}R)\n🏆 Record: {wr}")
             self.state[info["sym"]] = 0
             self.entry_info.pop(info["sym"], None)
             del self.open_pos[pid]
