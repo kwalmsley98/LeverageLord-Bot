@@ -239,6 +239,7 @@ class Bot:
         self.seen_bar = {s: 0 for s in cfg.symbols}
         self.open_pos = {}; self.entry_info = {}
         self.scan_seen_bar = 0
+        self.last_scan = {"top": [], "universe": 0, "signals": 0}
         self.eq_hist = []
         self.day_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.day_start_eq = None
@@ -407,7 +408,15 @@ class Bot:
             except Exception:
                 continue
         if not data: return
-        logging.info(f"scanner universe: {len(data)} pairs")
+        top = []
+        for s, r in data.items():
+            if len(r) >= 26:
+                top.append((r[-1]["c"]/r[-25]["c"]-1, s))
+        top.sort(reverse=True)
+        self.last_scan = {"top": [(s, g) for g, s in top[:5]], "universe": len(data), "signals": 0}
+        tstr = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for g, s in top[:5]) or "n/a"
+        logging.info(f"scanner universe: {len(data)} pairs | top24h: {tstr}")
+        logging.info(f"SCAN REPORT | universe {len(data)} | top: {tstr} | signals queued: 0")
         held = {info["sym"] for info in self.open_pos.values()}
         cands = []
         for s, r in data.items():
@@ -435,6 +444,7 @@ class Bot:
             qty = (self.cfg.scanner_risk/rd)*equity/price
             qty = min(qty, 5.0*equity/price)
             if qty*price < 10: continue
+            self.last_scan["signals"] += 1
             logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
             notify(f"🚀 <b>SCANNER · {s}</b> 🔥 top gainer +{ret24*100:.1f}%/24h\n"
                    f"📍 Entry ~{price:.4f}\n🛑 {stop:.4f} · 🎯 {target:.4f}\n"
@@ -494,7 +504,10 @@ class Bot:
                                f"📈 {sparkline(self.eq_hist)}")
                     self.day_start_eq = eq
                     status = "✅ running" if not (self.risk.halted_today or self.risk.killed) else "⏸ halted"
+                    logging.info(f"heartbeat: equity ${eq:.2f} open={len(self.open_pos)} trades={n} status={status}")
+                    top3 = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for s, g in self.last_scan.get("top", [])[:3]) or "awaiting first scan"
                     notify(f"💓 Equity <b>${eq:.2f}</b> · {len(self.open_pos)} open · {n} trades (WR {wr}) · {status}\n"
+                           f"🔎 Market: {top3}\n"
                            f"📈 {sparkline(self.eq_hist)}")
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
