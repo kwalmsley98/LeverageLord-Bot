@@ -201,6 +201,17 @@ class BitunixClient:
                 continue
     def place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
               stop=None, target=None, tick=0.1):
+        # NOTE: returns ("bracket"|"plain", result). Falls back to plain if bracket rejected.
+        try:
+            return ("bracket", self._place(symbol, side, qty, trade_side, order_type, price, stop, target, tick))
+        except Exception as e:
+            if trade_side == "OPEN" and (stop or target) and "place_order" in str(e):
+                logging.warning(f"bracket rejected ({e}) - placing plain order, bot will manage exit")
+                return ("plain", self._place(symbol, side, qty, trade_side, order_type, price, None, None, tick))
+            raise
+
+    def _place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
+               stop=None, target=None, tick=0.1):
         payload={"symbol":symbol,"side":side,"qty":fmt_qty(qty),"tradeSide":trade_side,
                  "orderType":order_type,"effect":"GTC","clientId":str(int(time.time()*1000)),
                  "reduceOnly": trade_side=="CLOSE"}
@@ -391,7 +402,7 @@ class Bot:
                 logging.error(f"{sym}: entry unconfirmed — not tracked"); return
         for _pid,_info in self.open_pos.items():
             if _info["sym"]==sym and "entry" not in _info:
-                _info.update({"entry":price,"stop":stop,"side":new_side,"kind":kind})
+                _info.update({"entry":price,"stop":stop,"target":target,"side":new_side,"kind":kind,"qty":qty})
         self.state[sym]=new_side
         self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd,"stop":stop,"side":new_side}
 
@@ -472,7 +483,7 @@ class Bot:
                     time.sleep(1); self.sync()
                     for _pid,_info in self.open_pos.items():
                         if _info["sym"]==s and "entry" not in _info:
-                            _info.update({"entry":price,"stop":stop,"side":1,"kind":"scanner"})
+                            _info.update({"entry":price,"stop":stop,"target":target,"side":1,"kind":"scanner","qty":qty})
                 except Exception as e:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
@@ -528,6 +539,44 @@ class Bot:
             logging.error(f"test trade failed: {e}")
             notify(f"🧪 TEST FAILED: {e}")
 
+
+    def manage_exits(self):
+        """Close positions with market orders when price hits stop/target.
+        This makes exits independent of exchange-side TP/SL bracket validation."""
+        for pid, info in list(self.open_pos.items()):
+            if not info.get("entry") or not info.get("stop") or not info.get("target") or not info.get("qty"):
+                continue
+            try:
+                mk = self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
+            except Exception:
+                continue
+            side = info.get("side", 1)
+            hit_stop = mk <= info["stop"] if side > 0 else mk >= info["stop"]
+            hit_tgt  = mk >= info["target"] if side > 0 else mk <= info["target"]
+            if not (hit_stop or hit_tgt):
+                continue
+            exit_p = mk
+            R = (exit_p - info["entry"]) / abs(info["entry"] - info["stop"]) * side
+            try:
+                close_side = "SELL" if side > 0 else "BUY"
+                self.client.place(info["sym"], close_side, info["qty"], "CLOSE")
+                logging.info(f"MANAGED EXIT {info['sym']} at {exit_p:.4f} (R={R:+.2f})")
+            except Exception as e:
+                logging.error(f"managed exit failed {info['sym']}: {e}")
+                continue
+            if info.get("kind") != "test":
+                self.risk.record_trade(R > 0)
+            wins = sum(self.risk.trades); n = len(self.risk.trades)
+            wr = f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "0/0"
+            e2 = "🧪" if info.get("kind")=="test" else ("🟢" if R>0 else "🔴")
+            w2 = "TEST CLOSED" if info.get("kind")=="test" else ("WIN ✅" if R>0 else "LOSS ❌")
+            self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R","bot-managed exit")
+            notify(f"{e2} <b>{info['sym']} CLOSED · {w2}</b>\n"
+                   f"💰 Result: <b>{R:+.2f}R</b>\n🏆 Record: {wr}")
+            self.state[info["sym"]] = 0
+            self.entry_info.pop(info["sym"], None)
+            del self.open_pos[pid]
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         mode = "🔴 LIVE (real money)" if not self.cfg.dry_run else "🟡 DRY-RUN (paper)"
@@ -540,7 +589,9 @@ class Bot:
         beats_between = max(1, 3600 // max(self.cfg.poll_seconds, 1))   # ~1 per hour
         while True:
             try:
-                if not self.cfg.dry_run: self.sync()
+                if not self.cfg.dry_run:
+                    self.sync()
+                    self.manage_exits()
                 eq=self.equity()
                 if eq<=0:
                     if not getattr(self,"_warned_eq",False):
