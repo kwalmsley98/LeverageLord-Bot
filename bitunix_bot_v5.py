@@ -91,6 +91,16 @@ def notify(msg):
     except Exception:
         pass
 
+def foot():
+    return f"\n— LeverageLord · {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
+
+def streak_of(trades):
+    s = 0
+    for t in reversed(trades):
+        if t: s += 1
+        else: break
+    return s
+
 def sparkline(vals, width=24):
     if not vals: return ""
     vals = vals[-width:]
@@ -334,9 +344,14 @@ class Bot:
                 e = "🧪" if info.get("kind")=="test" else ("🟢" if R>0 else "🔴")
                 w = "TEST CLOSED" if info.get("kind")=="test" else ("WIN ✅" if R>0 else "LOSS ❌")
                 pct = R * info.get("risk_frac", 0.015) * 100
+                rf = info.get("risk_frac", 0.015); eq0 = info.get("eq_at_entry", 0)
+                eq_now = eq0*(1+R*rf) if eq0 else 0
+                st = streak_of(self.risk.trades)
                 self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R ({pct:+.2f}%)","tp/sl/external")
+                eqline = f"\n🏦 Equity ${eq_now:.2f}" if eq_now else ""
+                stline = f" 🔥{st} win streak" if st >= 2 else ""
                 notify(f"{e} <b>{info['sym']} CLOSED · {w}</b>\n"
-                       f"💰 Result: <b>{pct:+.2f}%</b> ({R:+.2f}R)\n🏆 Record: {wr}")
+                       f"💰 Result: <b>{pct:+.2f}%</b> ({R:+.2f}R)\n🏆 Record: {wr}{stline}{eqline}" + foot())
                 self.state[info["sym"]]=0; self.entry_info.pop(info["sym"],None); del self.open_pos[pid]
         for pid,p in live.items():
             if pid not in self.open_pos:
@@ -416,9 +431,12 @@ class Bot:
         side = "BUY" if new_side>0 else "SELL"
         logging.info(f"{sym}: ENTER {kind} {side} qty={fmt_qty(qty)} stop={stop:.2f} tgt={target:.2f}")
         d = "🟢 LONG" if new_side>0 else "🔴 SHORT"
+        rd = abs(price-stop)/price*100
+        rr = abs(target-price)/abs(price-stop)
         notify(f"{d} <b>{sym}</b> · {kind.upper()}\n"
-               f"📍 Entry {price:.4f}\n🛑 Stop {stop:.4f} · 🎯 Target {target:.4f}\n"
-               f"📊 Risk {risk*100:.2f}% · notional ~${qty*price:.0f}")
+               f"📍 Entry <code>{price:.4f}</code>\n"
+               f"🛑 <code>{stop:.4f}</code> (−{rd:.1f}%)   🎯 <code>{target:.4f}</code> (+{rd*rr:.1f}%)\n"
+               f"⚖️ 1 : {rr:.1f} · 📊 Risk {risk*100:.2f}% · Size ~${qty*price:.0f}" + foot())
         if self.cfg.dry_run:
             self.log(sym, kind, side, fmt_qty(qty), f"{stop:.2f}", f"{target:.2f}", "", "DRY_RUN")
             self.open_pos[f"dry-{sym}-{int(time.time()*1000)}"]={"sym":sym,"pnl":0.0}
@@ -447,7 +465,7 @@ class Bot:
                 logging.error(f"{sym}: entry unconfirmed — not tracked"); return
         for _pid,_info in self.open_pos.items():
             if _info["sym"]==sym and "entry" not in _info:
-                _info.update({"entry":price,"stop":stop,"target":target,"side":new_side,"kind":kind,"qty":qty,"risk_frac":risk})
+                _info.update({"entry":price,"stop":stop,"target":target,"side":new_side,"kind":kind,"qty":qty,"risk_frac":risk,"eq_at_entry":equity})
         self.state[sym]=new_side
         self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd,"stop":stop,"side":new_side}
 
@@ -517,9 +535,10 @@ class Bot:
             if qty*price < 10: continue
             self.last_scan["signals"] += 1
             logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
-            notify(f"🚀 <b>SCANNER · {s}</b> 🔥 top gainer +{ret24*100:.1f}%/24h\n"
-                   f"📍 Entry ~{price:.4f}\n🛑 {stop:.4f} · 🎯 {target:.4f}\n"
-                   f"📊 Risk {self.cfg.scanner_risk*100:.1f}%")
+            rd = abs(price-stop)/price*100
+            notify(f"🚀 <b>SCANNER · {s}</b> 🔥 +{ret24*100:.1f}%/24h\n"
+                   f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> (−{rd:.1f}%) · 🎯 <code>{target:.4f}</code>\n"
+                   f"📊 Risk {self.cfg.scanner_risk*100:.1f}%" + foot())
             if self.cfg.dry_run:
                 self.log(s, "scanner", "BUY", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
                 self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym":s, "pnl":0.0, "kind":"scanner"}
@@ -529,7 +548,7 @@ class Bot:
                     time.sleep(1); self.sync()
                     for _pid,_info in self.open_pos.items():
                         if _info["sym"]==s and "entry" not in _info:
-                            _info.update({"entry":price,"stop":stop,"target":target,"side":1,"kind":"scanner","qty":qty,"risk_frac":self.cfg.scanner_risk})
+                            _info.update({"entry":price,"stop":stop,"target":target,"side":1,"kind":"scanner","qty":qty,"risk_frac":self.cfg.scanner_risk,"eq_at_entry":equity})
                 except Exception as e:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
@@ -545,8 +564,9 @@ class Bot:
             detail = (f"\n📋 {s0.replace('USDT','')}: breakout close {'✅' if brk else '❌'} "
                       f"({r[-1]['c']:.4f} vs {hi:.4f}) · vol {'✅' if vs else '❌'} ({r[-1]['vol']/(vma or 1):.1f}x)")
         sig = self.last_scan["signals"]
-        notify(f"🔎 <b>SCAN · {len(data)} pairs swept</b>\n🏆 {tstr}{detail}\n"
-               f"{'🚀 ' + str(sig) + ' SIGNAL(S) FIRED' if sig else '✅ evaluated all gates - no qualifying setup, standing by'}")
+        notify(f"🔎 <b>SCAN</b> — {len(data)} pairs swept\n"
+               f"🏆 {tstr}{detail}\n"
+               f"{'🚀 ' + str(sig) + ' SIGNAL(S) FIRED' if sig else '✅ all gates evaluated — standing by'}" + foot())
 
 
     def poll_commands(self):
@@ -577,7 +597,11 @@ class Bot:
         wr = f"{wins/n*100:.0f}%" if n else "n/a"
         pos = "\n".join(f"• {i['sym']} (risk {i.get('risk','?')})" for i in self.entry_info.values()) or "none"
         top3 = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for s, g in self.last_scan.get("top", [])[:3]) or "awaiting first scan"
-        notify(f"📊 <b>STATUS</b>\n🏦 Equity ${eq:.2f}\n📂 Open: {pos}\n📝 Trades: {n} (WR {wr})\n🔎 Market: {top3}\n🛑 Halted: {self.risk.halted_today or self.risk.killed}")
+        notify(f"📊 <b>STATUS</b>\n"
+               f"🏦 Equity <b>${eq:.2f}</b> · 📝 {n} trades (WR {wr})\n"
+               f"📂 Open: {pos}\n"
+               f"🔎 {top3}\n"
+               f"🛑 Halted: {self.risk.halted_today or self.risk.killed}" + foot())
 
     def test_trade(self, sym="BTCUSDT"):
         valid = self.client.valid_symbols()
@@ -606,8 +630,9 @@ class Bot:
                     rf = (abs(price-stop)/price*qty*price)/max(eq,1e-9)
                     info.update({"entry": price, "stop": stop, "side": 1, "kind": "test", "target": target, "qty": qty, "risk_frac": rf}); found = True
             logging.info(f"TEST TRADE fired {sym} qty={fmt_qty(qty)} stop={stop:.1f} target={target:.1f}")
-            notify(f"🧪 <b>TEST ENTER {sym}</b>\n📍 {price:.4f} · 🛑 {stop:.4f} · 🎯 {target:.4f}\n"
-                   f"💵 Notional ${notional:.0f} (tiny)\n⏳ You'll get a CLOSED message when TP/SL resolves - pipeline proven.")
+            notify(f"🧪 <b>TEST ENTER {sym}</b>\n"
+                   f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>\n"
+                   f"💵 ${notional:.0f} (tiny) · ⏳ awaiting resolution…" + foot())
         except Exception as e:
             logging.error(f"test trade failed: {e}")
             notify(f"🧪 TEST FAILED: {e}")
@@ -644,9 +669,14 @@ class Bot:
             e2 = "🧪" if info.get("kind")=="test" else ("🟢" if R>0 else "🔴")
             w2 = "TEST CLOSED" if info.get("kind")=="test" else ("WIN ✅" if R>0 else "LOSS ❌")
             pct = R * info.get("risk_frac", 0.015) * 100
+            rf = info.get("risk_frac", 0.015); eq0 = info.get("eq_at_entry", 0)
+            eq_now = eq0*(1+R*rf) if eq0 else 0
+            st = streak_of(self.risk.trades)
             self.log(info["sym"],"CLOSED","","","","","",f"{R:+.2f}R ({pct:+.2f}%)","bot-managed exit")
+            eqline = f"\n🏦 Equity ${eq_now:.2f}" if eq_now else ""
+            stline = f" 🔥{st} win streak" if st >= 2 else ""
             notify(f"{e2} <b>{info['sym']} CLOSED · {w2}</b>\n"
-                   f"💰 Result: <b>{pct:+.2f}%</b> ({R:+.2f}R)\n🏆 Record: {wr}")
+                   f"💰 Result: <b>{pct:+.2f}%</b> ({R:+.2f}R)\n🏆 Record: {wr}{stline}{eqline}" + foot())
             self.state[info["sym"]] = 0
             self.entry_info.pop(info["sym"], None)
             del self.open_pos[pid]
@@ -667,10 +697,9 @@ class Bot:
             self.state = {s: 0 for s in self.cfg.symbols}
         mode = "🔴 LIVE (real money)" if not self.cfg.dry_run else "🟡 DRY-RUN (paper)"
         notify(f"🤖 <b>LEVERAGELORD ONLINE</b>\n"
-               f"⚙️ Mode: {mode}\n"
-               f"👁 Watching {len(self.cfg.symbols)} core pairs + dynamic scanner\n"
+               f"{mode} · {len(self.cfg.symbols)} core pairs · dynamic scanner\n"
                f"🎯 Target ~5%/mo · verdict at 40 trades\n"
-               f"💓 Heartbeats hourly · kill switch armed")
+               f"🛡 Breaker −5%/day · kill switch armed" + foot())
         beats = 0
         beats_between = max(1, 3600 // max(self.cfg.poll_seconds, 1))   # ~1 per hour
         while True:
@@ -701,16 +730,19 @@ class Bot:
                         chg = (eq/base-1)*100 if base else 0
                         c = "🟢" if chg>=0 else "🔴"
                         notify(f"📅 <b>DAILY SUMMARY · {today}</b>\n"
-                               f"🏦 Equity ${eq:.2f} ({c}{chg:+.1f}% today)\n"
-                               f"📝 Trades: {n} · 🏆 WR {wr}\n"
-                               f"📈 {sparkline(self.eq_hist)}")
+                               f"🏦 Equity <b>${eq:.2f}</b> ({c}{chg:+.1f}% today)\n"
+                               f"📝 {n} trades · 🏆 WR {wr}" + (f" · 🔥{streak_of(self.risk.trades)} win streak" if streak_of(self.risk.trades)>=2 else "") + f"\n"
+                               f"📈 <code>{sparkline(self.eq_hist)}</code>" + foot())
                     self.day_start_eq = eq
                     status = "✅ running" if not (self.risk.halted_today or self.risk.killed) else "⏸ halted"
                     logging.info(f"heartbeat: equity ${eq:.2f} open={len(self.open_pos)} trades={n} status={status}")
                     top3 = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for s, g in self.last_scan.get("top", [])[:3]) or "awaiting first scan"
-                    notify(f"💓 Equity <b>${eq:.2f}</b> · {len(self.open_pos)} open · {n} trades (WR {wr}) · {status}\n"
-                           f"🔎 Market: {top3}\n"
-                           f"📈 {sparkline(self.eq_hist)}")
+                    st = streak_of(self.risk.trades)
+                    chg = (eq/(self.day_start_eq or eq)-1)*100
+                    notify(f"💓 <b>Equity ${eq:.2f}</b> ({chg:+.1f}% today) · {status}\n"
+                           f"📂 {len(self.open_pos)} open · 📝 {n} trades · 🏆 {wr}" + (f" · 🔥{st}" if st>=2 else "") + f"\n"
+                           f"🔎 {top3}\n"
+                           f"📈 <code>{sparkline(self.eq_hist)}</code>" + foot())
                 self.poll_commands()
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
