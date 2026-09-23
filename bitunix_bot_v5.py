@@ -561,8 +561,12 @@ class Bot:
             vma = sum(vols)/len(vols) if vols else 0
             brk = r[-1]["c"] > hi
             vs = vma > 0 and r[-1]["vol"] > 1.2*vma
+            need = (hi - r[-1]['c']) / r[-1]['c'] * 100
+            trigger = (f"⚡ needs close {'≥' if need>=0 else '≤'} <code>{hi:.4f}</code> ({need:+.1f}%) with vol ≥1.2×"
+                       if need > 0 else "⚡ at/below trigger — watching volume")
             detail = (f"\n📋 {s0.replace('USDT','')}: breakout close {'✅' if brk else '❌'} "
-                      f"({r[-1]['c']:.4f} vs {hi:.4f}) · vol {'✅' if vs else '❌'} ({r[-1]['vol']/(vma or 1):.1f}x)")
+                      f"({r[-1]['c']:.4f} vs {hi:.4f}) · vol {'✅' if vs else '❌'} ({r[-1]['vol']/(vma or 1):.1f}x)\n"
+                      f"{trigger}")
         sig = self.last_scan["signals"]
         notify(f"🔎 <b>SCAN</b> — {len(data)} pairs swept\n"
                f"🏆 {tstr}{detail}\n"
