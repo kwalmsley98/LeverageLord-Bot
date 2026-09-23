@@ -19,6 +19,7 @@ import os, time, json, hashlib, logging, csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import requests
+import math
 
 BASE = "https://fapi.bitunix.com"
 INTERVAL_MS = {"1h": 3600e3, "4h": 14400e3}
@@ -217,11 +218,33 @@ class BitunixClient:
                 continue
     def place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
               stop=None, target=None, tick=0.1):
-        # NOTE: returns ("bracket"|"plain", result). Falls back to plain if bracket rejected.
+        # returns ("bracket"|"plain", result).
+        # OPEN orders: auto-retry qty at every valid precision (0.001 -> 1.0), then fall back to plain.
+        if trade_side == "OPEN":
+            steps = [0.001, 0.01, 0.1, 1.0]
+            last_e = None
+            for st in steps:
+                q2 = math.floor(qty/st)*st
+                if q2 <= 0: q2 = st
+                try:
+                    return ("bracket", self._place(symbol, side, q2, trade_side, order_type, price, stop, target, tick))
+                except Exception as e:
+                    last_e = e
+                    if "10002" in str(e):
+                        continue                      # wrong qty precision -> next step
+                    logging.warning(f"bracket rejected ({e}) - trying plain order")
+                    try:
+                        return ("plain", self._place(symbol, side, q2, trade_side, order_type, price, None, None, tick))
+                    except Exception as e2:
+                        last_e = e2
+                        if "10002" in str(e2):
+                            continue
+                        raise
+            raise last_e
         try:
             return ("bracket", self._place(symbol, side, qty, trade_side, order_type, price, stop, target, tick))
         except Exception as e:
-            if trade_side == "OPEN" and (stop or target) and "place_order" in str(e):
+            if "place_order" in str(e):
                 logging.warning(f"bracket rejected ({e}) - placing plain order, bot will manage exit")
                 return ("plain", self._place(symbol, side, qty, trade_side, order_type, price, None, None, tick))
             raise
@@ -510,6 +533,20 @@ class Bot:
                 except Exception as e:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
+        detail = ""
+        if top:
+            g0, s0 = top[0]
+            r = data[s0]
+            hi = max(x["h"] for x in r[-21:-1])
+            vols = [x["vol"] for x in r[-22:-2]]
+            vma = sum(vols)/len(vols) if vols else 0
+            brk = r[-1]["c"] > hi
+            vs = vma > 0 and r[-1]["vol"] > 1.2*vma
+            detail = (f"\n📋 {s0.replace('USDT','')}: breakout close {'✅' if brk else '❌'} "
+                      f"({r[-1]['c']:.4f} vs {hi:.4f}) · vol {'✅' if vs else '❌'} ({r[-1]['vol']/(vma or 1):.1f}x)")
+        sig = self.last_scan["signals"]
+        notify(f"🔎 <b>SCAN · {len(data)} pairs swept</b>\n🏆 {tstr}{detail}\n"
+               f"{'🚀 ' + str(sig) + ' SIGNAL(S) FIRED' if sig else '✅ evaluated all gates - no qualifying setup, standing by'}")
 
 
     def poll_commands(self):
