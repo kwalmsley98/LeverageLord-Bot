@@ -39,6 +39,9 @@ class Config:
     max_open_risk: float = 0.07
     min_qty_map: dict = field(default_factory=lambda: {"BTCUSDT": 0.001})
     min_notional_usdt: float = 15.0
+    mode: str = field(default_factory=lambda: os.getenv("MODE", "strict").lower())
+    #   strict = validated gates (positive in ALL tested regimes - recommended)
+    #   active = looser gates (~40% more trades, regime-dependent edge - your call)
     scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
     scanner_min_vol24: float = 10_000_000.0   # 24h volume floor (Bitunix-native vol) - 1000PEPE/WIF qualify, 1-7M shrapnel excluded
     scanner_max_pairs: int = 40      # cap on universe size per scan
@@ -531,8 +534,10 @@ class Bot:
             if s in held: continue
             closes = [x["c"] for x in r]
             ret24 = closes[-1]/closes[-25] - 1
-            if ret24 > self.cfg.scanner_ret:
-                hi20 = max(x["h"] for x in r[-21:-1])
+            ret_th = 0.025 if self.cfg.mode == "active" else self.cfg.scanner_ret
+            if ret24 > ret_th:
+                n = 10 if self.cfg.mode == "active" else 20
+                hi20 = max(x["h"] for x in r[-n-1:-1])
                 vols = [x["vol"] for x in r[-22:-2]]
                 vma = sum(vols)/len(vols) if vols else 0
                 brk = closes[-1] > hi20
@@ -585,8 +590,9 @@ class Bot:
             if s in held: continue
             closes = [x["c"] for x in r]
             ret24 = closes[-1]/closes[-25] - 1
-            if ret24 < -self.cfg.scanner_ret:
-                lo20 = min(x["l"] for x in r[-21:-1])
+            if ret24 < -(0.025 if self.cfg.mode == "active" else self.cfg.scanner_ret):
+                n = 10 if self.cfg.mode == "active" else 20
+                lo20 = min(x["l"] for x in r[-n-1:-1])
                 vols = [x["vol"] for x in r[-22:-2]]
                 vma = sum(vols)/len(vols) if vols else 0
                 brk_dn = closes[-1] < lo20
@@ -633,10 +639,11 @@ class Bot:
             slots_s -= 1
             held.add(s)
         detail = ""
+        n = 10 if self.cfg.mode == "active" else 20
         for g0, s0 in top[:3]:
             r = data[s0]
-            hi = max(x["h"] for x in r[-21:-1])
-            lo = min(x["l"] for x in r[-21:-1])
+            hi = max(x["h"] for x in r[-n-1:-1])
+            lo = min(x["l"] for x in r[-n-1:-1])
             vols = [x["vol"] for x in r[-22:-2]]
             vma = sum(vols)/len(vols) if vols else 0
             vx = r[-1]["vol"]/(vma or 1)
@@ -783,7 +790,7 @@ class Bot:
             self.state = {s: 0 for s in self.cfg.symbols}
         mode = "🔴 LIVE (real money)" if not self.cfg.dry_run else "🟡 DRY-RUN (paper)"
         notify(f"🤖 <b>LEVERAGELORD ONLINE</b>\n"
-               f"{mode} · {len(self.cfg.symbols)} core pairs · dynamic scanner\n"
+               f"{mode} · MODE: {self.cfg.mode.upper()} · {len(self.cfg.symbols)} core pairs · dynamic scanner\n"
                f"🎯 Target ~5%/mo · verdict at 40 trades\n"
                f"🛡 Breaker −5%/day · kill switch armed" + foot())
         beats = 0
