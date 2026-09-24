@@ -149,10 +149,10 @@ class BitunixClient:
     def klines(self, symbol, interval, limit=200, start_time=None, end_time=None):
         limit = min(limit, 200)
         if start_time is None:
-            span = limit * INTERVAL_MS.get(interval, 14400e3)
-            start_time = int(time.time()*1000) - span - 7200e3   # explicit recent window - kills stale data
-        params = {"symbol": symbol, "interval": interval, "limit": limit, "startTime": str(start_time)}
-        if end_time: params["endTime"] = str(end_time)
+            span = int(limit * INTERVAL_MS.get(interval, 14400e3))
+            start_time = int(time.time()*1000) - span - 7200000   # explicit recent window - kills stale data
+        params = {"symbol": symbol, "interval": interval, "limit": limit, "startTime": str(int(start_time))}
+        if end_time: params["endTime"] = str(int(end_time))
         rows = self._req("GET", "/api/v1/futures/market/kline", params)
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
