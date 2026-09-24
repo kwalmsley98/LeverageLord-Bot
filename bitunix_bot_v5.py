@@ -516,7 +516,7 @@ class Bot:
                 vols = [x["vol"] for x in r[-22:-2]]
                 vma = sum(vols)/len(vols) if vols else 0
                 brk = closes[-1] > hi20
-                vspike = vma > 0 and r[-1]["vol"] > 1.2*vma
+                vspike = vma > 0 and r[-1]["vol"] > 1.0*vma
                 if brk and vspike:
                     trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"]))
                              for i in range(-14, 0)]
@@ -525,14 +525,20 @@ class Bot:
         cands.sort(reverse=True)
         slots = self.cfg.scanner_max - sum(1 for i in self.open_pos.values() if i.get("kind")=="scanner")
         for ret24, s, price, atr in cands:
-            if slots <= 0: break
+            if slots <= 0:
+                logging.warning(f"GATE-PASS {s} queued but slots full - SKIPPED")
+                continue
             rd = atr/price
-            if rd < 0.004 or rd > 0.06: continue
+            if rd < 0.004 or rd > 0.06:
+                logging.warning(f"GATE-PASS {s} all signal gates passed but stop {rd*100:.2f}% outside band")
+                continue
             stop = price - atr; target = price + self.cfg.tp_r*atr
             qty = (self.cfg.scanner_risk/rd)*equity/price
             qty = min(qty, 5.0*equity/price)
             qty = max(qty, self.cfg.min_qty_map.get(s, 0), self.cfg.min_notional_usdt/price)
-            if qty*price < 10: continue
+            if qty*price < 10:
+                logging.warning(f"GATE-PASS {s} all gates passed but size ${qty*price:.0f} below min")
+                continue
             self.last_scan["signals"] += 1
             logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
             rd = abs(price-stop)/price*100
@@ -564,7 +570,7 @@ class Bot:
                 vols = [x["vol"] for x in r[-22:-2]]
                 vma = sum(vols)/len(vols) if vols else 0
                 brk_dn = closes[-1] < lo20
-                vspike = vma > 0 and r[-1]["vol"] > 1.2*vma
+                vspike = vma > 0 and r[-1]["vol"] > 1.0*vma
                 if brk_dn and vspike:
                     trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"]))
                              for i in range(-14, 0)]
@@ -573,14 +579,20 @@ class Bot:
         cands_s.sort(reverse=True)
         slots_s = self.cfg.scanner_max - sum(1 for i in self.open_pos.values() if i.get("kind")=="scanner")
         for ret24, s, price, atr in cands_s:
-            if slots_s <= 0: break
+            if slots_s <= 0:
+                logging.warning(f"GATE-PASS SHORT {s} queued but slots full - SKIPPED")
+                continue
             rd = atr/price
-            if rd < 0.004 or rd > 0.06: continue
+            if rd < 0.004 or rd > 0.06:
+                logging.warning(f"GATE-PASS SHORT {s} stop {rd*100:.2f}% outside band")
+                continue
             stop = price + atr; target = price - self.cfg.tp_r*atr
             qty = (self.cfg.scanner_risk/rd)*equity/price
             qty = min(qty, 5.0*equity/price)
             qty = max(qty, self.cfg.min_qty_map.get(s, 0), self.cfg.min_notional_usdt/price)
-            if qty*price < 10: continue
+            if qty*price < 10:
+                logging.warning(f"GATE-PASS {s} all gates passed but size ${qty*price:.0f} below min")
+                continue
             self.last_scan["signals"] += 1
             logging.info(f"SCANNER SHORT {s} (24h -{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
             notify(f"🔻 <b>SCANNER SHORT · {s}</b> 📉 −{ret24*100:.1f}%/24h\n"
@@ -601,20 +613,22 @@ class Bot:
             slots_s -= 1
             held.add(s)
         detail = ""
-        if top:
-            g0, s0 = top[0]
+        for g0, s0 in top[:3]:
             r = data[s0]
             hi = max(x["h"] for x in r[-21:-1])
+            lo = min(x["l"] for x in r[-21:-1])
             vols = [x["vol"] for x in r[-22:-2]]
             vma = sum(vols)/len(vols) if vols else 0
-            brk = r[-1]["c"] > hi
-            vs = vma > 0 and r[-1]["vol"] > 1.2*vma
-            need = (hi - r[-1]['c']) / r[-1]['c'] * 100
-            trigger = (f"⚡ needs close {'≥' if need>=0 else '≤'} <code>{hi:.4f}</code> ({need:+.1f}%) with vol ≥1.2×"
-                       if need > 0 else "⚡ at/below trigger — watching volume")
-            detail = (f"\n📋 {s0.replace('USDT','')}: breakout close {'✅' if brk else '❌'} "
-                      f"({r[-1]['c']:.4f} vs {hi:.4f}) · vol {'✅' if vs else '❌'} ({r[-1]['vol']/(vma or 1):.1f}x)\n"
-                      f"{trigger}")
+            vx = r[-1]["vol"]/(vma or 1)
+            brk = r[-1]["c"] > hi; brk_dn = r[-1]["c"] < lo
+            if brk:
+                gate = "LONG READY ✅"
+            elif brk_dn:
+                gate = "SHORT READY ✅"
+            else:
+                need = (hi - r[-1]['c'])/r[-1]['c']*100 if g0 > 0 else (r[-1]['c'] - lo)/r[-1]['c']*100
+                gate = f"{need:+.1f}% from trigger · vol {vx:.1f}x"
+            detail += f"\n📋 {s0.replace('USDT','')} {g0*100:+.1f}%: {gate}"
         sig = self.last_scan["signals"]
         notify(f"🔎 <b>SCAN</b> — {len(data)} pairs swept\n"
                f"🏆 {tstr}{detail}\n"
