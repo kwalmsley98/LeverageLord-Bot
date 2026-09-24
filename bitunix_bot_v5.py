@@ -143,9 +143,14 @@ class BitunixClient:
         if data.get("code") != 0:
             raise RuntimeError(f"{path} -> code {data.get('code')}: {data.get('msg')}")
         return data.get("data")
-    def klines(self, symbol, interval, limit=200):
-        rows = self._req("GET", "/api/v1/futures/market/kline",
-                         {"symbol": symbol, "interval": interval, "limit": min(limit, 200)})
+    def klines(self, symbol, interval, limit=200, start_time=None, end_time=None):
+        limit = min(limit, 200)
+        if start_time is None:
+            span = limit * INTERVAL_MS.get(interval, 14400e3)
+            start_time = int(time.time()*1000) - span - 7200e3   # explicit recent window - kills stale data
+        params = {"symbol": symbol, "interval": interval, "limit": limit, "startTime": str(start_time)}
+        if end_time: params["endTime"] = str(end_time)
+        rows = self._req("GET", "/api/v1/futures/market/kline", params)
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
@@ -489,12 +494,27 @@ class Bot:
             except Exception as e:
                 logging.warning(f"ticker fetch failed ({e}) - using fallback list")
         data = {}
+        live_px = {}
+        try:
+            live_px = {t["symbol"]: float(t.get("lastPrice") or 0) for t in self.client.tickers()}
+        except Exception:
+            pass
+        stale = 0
         for s in universe:
             try:
                 rows = self.client.klines(s, self.cfg.interval, 100)
-                if len(rows) >= 30: data[s] = rows[:-1]      # drop forming bar - closed bars only
+                if len(rows) >= 30:
+                    rows = rows[:-1]                          # drop forming bar - closed bars only
+                    lp = live_px.get(s)
+                    if lp and abs(rows[-1]["c"] - lp)/lp > 0.08:
+                        stale += 1
+                        logging.warning(f"STALE DATA {s}: kline close {rows[-1]['c']} vs live {lp} - excluded from scan")
+                        continue
+                    data[s] = rows
             except Exception:
                 continue
+        if stale:
+            notify(f"⚠️ {stale} pairs had stale price data and were excluded (Bitunix feed issue)")
         if not data: return
         top = []
         for s, r in data.items():
