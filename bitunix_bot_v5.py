@@ -552,6 +552,54 @@ class Bot:
                 except Exception as e:
                     logging.error(f"scanner entry failed {s}: {e}")
             slots -= 1
+            held.add(s)
+        # SHORT engine: weakest movers breaking DOWN with volume (validated: +23R crash window)
+        cands_s = []
+        for s, r in data.items():
+            if s in held: continue
+            closes = [x["c"] for x in r]
+            ret24 = closes[-1]/closes[-25] - 1
+            if ret24 < -self.cfg.scanner_ret:
+                lo20 = min(x["l"] for x in r[-21:-1])
+                vols = [x["vol"] for x in r[-22:-2]]
+                vma = sum(vols)/len(vols) if vols else 0
+                brk_dn = closes[-1] < lo20
+                vspike = vma > 0 and r[-1]["vol"] > 1.2*vma
+                if brk_dn and vspike:
+                    trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"]))
+                             for i in range(-14, 0)]
+                    atr = sum(trs)/len(trs)
+                    cands_s.append((-ret24, s, r[-1]["c"], atr))
+        cands_s.sort(reverse=True)
+        slots_s = self.cfg.scanner_max - sum(1 for i in self.open_pos.values() if i.get("kind")=="scanner")
+        for ret24, s, price, atr in cands_s:
+            if slots_s <= 0: break
+            rd = atr/price
+            if rd < 0.004 or rd > 0.06: continue
+            stop = price + atr; target = price - self.cfg.tp_r*atr
+            qty = (self.cfg.scanner_risk/rd)*equity/price
+            qty = min(qty, 5.0*equity/price)
+            qty = max(qty, self.cfg.min_qty_map.get(s, 0), self.cfg.min_notional_usdt/price)
+            if qty*price < 10: continue
+            self.last_scan["signals"] += 1
+            logging.info(f"SCANNER SHORT {s} (24h -{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
+            notify(f"🔻 <b>SCANNER SHORT · {s}</b> 📉 −{ret24*100:.1f}%/24h\n"
+                   f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>\n"
+                   f"📊 Risk {self.cfg.scanner_risk*100:.1f}%" + foot())
+            if self.cfg.dry_run:
+                self.log(s, "scanner-short", "SELL", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
+                self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym":s, "pnl":0.0, "kind":"scanner", "side":-1}
+            else:
+                try:
+                    self.client.place(s, "SELL", qty, "OPEN", stop=stop, target=target, tick=0.0001)
+                    time.sleep(1); self.sync()
+                    for _pid,_info in self.open_pos.items():
+                        if _info["sym"]==s and "entry" not in _info:
+                            _info.update({"entry":price,"stop":stop,"target":target,"side":-1,"kind":"scanner","qty":qty,"risk_frac":self.cfg.scanner_risk,"eq_at_entry":equity})
+                except Exception as e:
+                    logging.error(f"scanner short entry failed {s}: {e}")
+            slots_s -= 1
+            held.add(s)
         detail = ""
         if top:
             g0, s0 = top[0]
