@@ -66,7 +66,7 @@ class Config:
     vol_spike: float = 1.5
     flow_long: float = 0.55
     flow_short: float = 0.45
-    daily_loss_limit: float = 0.05
+    daily_loss_limit: float = field(default_factory=lambda: float(os.getenv("DAILY_LOSS", "0.05")))  # breaker dial
     kill_min_trades: int = 40           # lower: candidate edge needs faster verdicts
     kill_wr_buffer: float = 0.02
     poll_seconds: int = field(default_factory=lambda: int(os.getenv("POLL_SECONDS", "60")))
@@ -870,19 +870,25 @@ class Bot:
             except Exception:
                 continue
             if t["side"] > 0 and px >= t["level"]:
+                atr = t["level"] - t["stop"]          # original 1x ATR
+                # CHASE PROTECTION: if price already gapped more than halfway to target, skip
+                if px >= t["level"] + 1.5*atr:
+                    logging.warning(f"TRIGGER GAP-SKIP {t['sym']}: filled-zone blown through ({t['level']:.4f} -> {px:.4f})")
+                    notify(f"⏭ <b>{t['sym']}</b> gapped through the trigger (+{(px/t['level']-1)*100:.1f}%) - skipped, no chase")
+                    self.triggers.remove(t); continue
+                stop = px - 1.0*atr; target = px + self.cfg.tp_r*atr   # RE-ANCHORED to actual fill
                 try:
-                    tick = 0.0001 if t["level"] < 10 else 0.1
-                    self.client.place(t["sym"], "BUY", t["qty"], "OPEN", stop=t["stop"], target=t["target"], tick=tick)
+                    tick = 0.0001 if px < 10 else 0.1
+                    self.client.place(t["sym"], "BUY", t["qty"], "OPEN", stop=stop, target=target, tick=tick)
                     time.sleep(1); self.sync()
                     for pid, info in self.open_pos.items():
                         if info["sym"] == t["sym"] and "entry" not in info:
-                            info.update({"entry": t["level"], "stop": t["stop"], "target": t["target"],
+                            info.update({"entry": px, "stop": stop, "target": target,
                                          "side": 1, "kind": "scanner", "qty": t["qty"],
                                          "risk_frac": self.cfg.scanner_risk, "eq_at_entry": self.equity()})
-                    self.risk.record_trade_pending = getattr(self.risk, "record_trade_pending", 0)  # noop
-                    logging.info(f"TRIGGER FILLED {t['sym']} at {px:.4f}")
+                    logging.info(f"TRIGGER FILLED {t['sym']} at {px:.4f} stop {stop:.4f} target {target:.4f}")
                     notify(f"🚀 <b>TRIGGER FILLED · {t['sym']}</b>\n"
-                           f"📍 <code>{px:.4f}</code> · 🛑 <code>{t['stop']:.4f}</code> · 🎯 <code>{t['target']:.4f}</code>" + foot())
+                           f"📍 <code>{px:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>" + foot())
                     self.triggers.remove(t)
                 except Exception as e:
                     logging.error(f"trigger fill failed {t['sym']}: {e}")
