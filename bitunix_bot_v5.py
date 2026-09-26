@@ -319,6 +319,7 @@ class Bot:
         self.open_pos = {}; self.entry_info = {}
         self.scan_seen_bar = 0
         self.tg_offset = 0
+        self.triggers = []   # [{sym, side, level, stop, target, qty, expiry}]
         self.last_scan = {"top": [], "universe": 0, "signals": 0}
         self.eq_hist = []
         self.day_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -413,6 +414,21 @@ class Bot:
         if win==self.seen_bar[sym]: return
         self.seen_bar[sym]=win
         sig, kind, atrv = self.detect_signal(sym, rows[:-1])
+        if sig == 0:
+            try:
+                r = rows[:-1]
+                br = (r[-1]["tb"]/r[-1]["vol"]) if r[-1]["vol"]>0 else 0.5
+                n = self.cfg.donchian_n
+                hi = max(x["h"] for x in r[-n-1:-1]); lo = min(x["l"] for x in r[-n-1:-1])
+                c = r[-1]["c"]
+                closes = [x["c"] for x in r]
+                e = closes[0]
+                k2 = 2/(self.cfg.ema_trend+1)
+                for v in closes[1:]: e = v*k2 + e*(1-k2)
+                side_gap = (c/hi-1)*100 if c>lo else (c/lo-1)*100
+                logging.info(f"CORE {sym}: no signal | close {c:.4g} vs channel {hi:.4g}/{lo:.4g} ({side_gap:+.1f}%) | trend {'up' if c>e else 'DOWN'} | buyers {br*100:.0f}%")
+            except Exception:
+                pass
         if sig!=0 and sig!=self.state[sym]:
             self._flip(sym, sig, kind, rows, atrv, equity)
 
@@ -638,6 +654,33 @@ class Bot:
                     logging.error(f"scanner short entry failed {s}: {e}")
             slots_s -= 1
             held.add(s)
+        armed_now = 0
+        for g0, s0 in top[:3]:
+            if g0 <= 0: continue
+            r = data.get(s0)
+            if not r: continue
+            n = 10 if self.cfg.mode == "active" else 20
+            hi = max(x["h"] for x in r[-n-1:-1])
+            need = (hi - r[-1]["c"]) / r[-1]["c"]
+            if 0 < need <= 0.02 and s0 not in {t["sym"] for t in self.triggers} and s0 not in held:
+                price = r[-1]["c"]
+                trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"])) for i in range(-14, 0)]
+                atr = sum(trs)/len(trs)
+                rd = atr/price
+                if 0.004 <= rd <= 0.06:
+                    eq = equity
+                    qty = min((self.cfg.scanner_risk/rd)*eq/price, 5.0*eq/price)
+                    qty = max(qty, self.cfg.min_qty_map.get(s0, 0), self.cfg.min_notional_usdt/price)
+                    if qty*price >= 10:
+                        self.triggers.append({"sym": s0, "side": 1, "level": hi*1.001,
+                                              "stop": hi*1.001 - atr, "target": hi*1.001 + self.cfg.tp_r*atr,
+                                              "qty": qty, "expiry": time.time()+8*3600})
+                        armed_now += 1
+                        notify(f"⚡ <b>TRIGGER ARMED · {s0}</b>\n"
+                               f"fills if price touches <code>{hi*1.001:.4f}</code>\n"
+                               f"🛑 <code>{hi*1.001-atr:.4f}</code> · 🎯 <code>{hi*1.001+self.cfg.tp_r*atr:.4f}</code> · risk {self.cfg.scanner_risk*100:.1f}%" + foot())
+        if armed_now:
+            logging.info(f"TRIGGERS ARMED: {[t['sym'] for t in self.triggers]}")
         detail = ""
         n = 10 if self.cfg.mode == "active" else 20
         for g0, s0 in top[:3]:
@@ -678,6 +721,7 @@ class Bot:
                     if not sym.endswith("USDT"): sym += "USDT"
                     self.test_trade(sym)
                 elif text == "/status": self.status_report()
+                elif text == "/fire": self.fire_trade()
                 elif text == "/reset":
                     self.risk.trades = []
                     notify("🔄 Trade record wiped - 0 trades, clean slate. (Deploys also reset it.)")
@@ -774,6 +818,75 @@ class Bot:
             self.entry_info.pop(info["sym"], None)
             del self.open_pos[pid]
 
+
+    def fire_trade(self):
+        """MANUAL OVERRIDE - fires one trade on the hottest coin now. Not a strategy signal."""
+        notify("🎯 <b>MANUAL OVERRIDE</b> — taking the hottest coin now (not a strategy signal)...")
+        try:
+            tk = self.client.tickers()
+            hot = sorted((t for t in tk if t.get("symbol","").endswith("USDT") and float(t.get("vol24") or 0) >= 5e6),
+                         key=lambda t: float(t.get("lastPrice") or 0)/max(float(t.get("open") or 1),1e-9), reverse=True)
+            sym = None
+            for t in hot:
+                if t["symbol"] in self.cfg.symbols: continue
+                sym = t["symbol"]; break
+            if not sym: raise RuntimeError("no suitable coin")
+            rows = self.client.klines(sym, self.cfg.interval, 100)
+            if len(rows) < 20: raise RuntimeError("no data")
+            price = rows[-1]["c"]
+            trs = [max(rows[i]["h"]-rows[i]["l"], abs(rows[i]["h"]-rows[i-1]["c"]), abs(rows[i]["l"]-rows[i-1]["c"]))
+                     for i in range(-14, 0)]
+            atrv = sum(trs)/len(trs)
+            eq = self.equity()
+            qty = max(self.cfg.min_notional_usdt/price, 0.001 if "BTC" in sym else 0)
+            qty = max(qty, (self.cfg.scanner_risk/(atrv/price))*eq/price if atrv/price>=0.004 else self.cfg.min_notional_usdt/price)
+            qty = min(qty, 5.0*eq/price)
+            stop = price - atrv; target = price + self.cfg.tp_r*atrv
+            tick = 0.0001 if price < 10 else 0.1
+            self.client.place(sym, "BUY", qty, "OPEN", stop=stop, target=target, tick=tick)
+            time.sleep(1); self.sync()
+            for pid, info in self.open_pos.items():
+                if info["sym"] == sym and "entry" not in info:
+                    info.update({"entry":price,"stop":stop,"target":target,"side":1,"kind":"manual","qty":qty,
+                                 "risk_frac":self.cfg.scanner_risk,"eq_at_entry":eq})
+            logging.info(f"MANUAL OVERRIDE fired {sym}")
+            notify(f"🎯 <b>MANUAL OVERRIDE ENTER {sym}</b>\n"
+                   f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>\n"
+                   f"⚠️ Manual trade - excluded from the strategy record" + foot())
+        except Exception as e:
+            logging.error(f"manual override failed: {e}")
+            notify(f"🎯 OVERRIDE FAILED: {e}")
+
+
+    def check_triggers(self):
+        """Resting trigger orders: fill when price touches the level (validated +39R/+21R/+7R across windows)."""
+        if not self.triggers: return
+        live_syms = {i["sym"] for i in self.open_pos.values()}
+        for t in list(self.triggers):
+            if time.time() > t["expiry"] or t["sym"] in live_syms:
+                self.triggers.remove(t); continue
+            try:
+                px = self.client.klines(t["sym"], self.cfg.interval, 1)[-1]["c"]
+            except Exception:
+                continue
+            if t["side"] > 0 and px >= t["level"]:
+                try:
+                    tick = 0.0001 if t["level"] < 10 else 0.1
+                    self.client.place(t["sym"], "BUY", t["qty"], "OPEN", stop=t["stop"], target=t["target"], tick=tick)
+                    time.sleep(1); self.sync()
+                    for pid, info in self.open_pos.items():
+                        if info["sym"] == t["sym"] and "entry" not in info:
+                            info.update({"entry": t["level"], "stop": t["stop"], "target": t["target"],
+                                         "side": 1, "kind": "scanner", "qty": t["qty"],
+                                         "risk_frac": self.cfg.scanner_risk, "eq_at_entry": self.equity()})
+                    self.risk.record_trade_pending = getattr(self.risk, "record_trade_pending", 0)  # noop
+                    logging.info(f"TRIGGER FILLED {t['sym']} at {px:.4f}")
+                    notify(f"🚀 <b>TRIGGER FILLED · {t['sym']}</b>\n"
+                           f"📍 <code>{px:.4f}</code> · 🛑 <code>{t['stop']:.4f}</code> · 🎯 <code>{t['target']:.4f}</code>" + foot())
+                    self.triggers.remove(t)
+                except Exception as e:
+                    logging.error(f"trigger fill failed {t['sym']}: {e}")
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         valid = None if self.cfg.dry_run else self.client.valid_symbols()
@@ -799,6 +912,7 @@ class Bot:
             try:
                 if not self.cfg.dry_run:
                     self.sync()
+                    self.check_triggers()
                     self.manage_exits()
                 eq=self.equity()
                 if eq<=0:
