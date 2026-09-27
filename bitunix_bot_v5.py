@@ -772,6 +772,7 @@ class Bot:
                     if not sym.endswith("USDT"): sym += "USDT"
                     self.test_trade(sym)
                 elif text == "/status": self.status_report()
+                elif text in ("/start", "/help"): self.welcome()
                 elif text == "/fire": self.fire_trade()
                 elif text.startswith("/risk"): self.set_risk(text)
                 elif text == "/reset":
@@ -1009,6 +1010,19 @@ class Bot:
         notify(f"🎚 <b>RISK → {lvl.upper()}</b>\n"
                f"Core {p['risk_map']['ETHUSDT']*100:.1f}% · Scanner {p['scanner_risk']*100:.2f}% · Max open {p['max_open_risk']*100:.0f}%\n"
                f"Applies to all NEW trades. Note: resets to config default on redeploy." + foot())
+
+
+    def welcome(self):
+        notify(f"🤖 <b>Welcome to LeverageLord</b> — your personal trading bot.\n\n"
+               f"📊 The <b>pinned dashboard</b> (top of this chat) shows live equity, trades and win rate - updated hourly.\n\n"
+               f"⚡ <b>The bot trades automatically</b> - breakout triggers, volume surges and trend shorts, "
+               f"with stops and targets managed for you. Your job: pick a risk level, then let it work.\n\n"
+               f"🎚 /risk low | medium | high — adjust risk appetite\n"
+               f"📈 /status — live report anytime\n"
+               f"🧪 /test — fire a tiny test trade (proves the pipeline)\n"
+               f"🔄 /reset — wipe the trade record\n\n"
+               f"⚠️ <b>Trading involves real risk.</b> Start small, never risk what you can't afford to lose, "
+               f"and let the stops do their job." + foot())
 
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
