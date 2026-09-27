@@ -654,6 +654,51 @@ class Bot:
                     logging.error(f"scanner short entry failed {s}: {e}")
             slots_s -= 1
             held.add(s)
+        # VOLUME SURGE engine: enter on >=2x volume expansion before the breakout (validated +28R/+53R/+10R)
+        slots_v = self.cfg.scanner_max - sum(1 for i in self.open_pos.values() if i.get("kind")=="scanner")
+        for s, r in data.items():
+            if slots_v <= 0: break
+            if s in held: continue
+            closes = [x["c"] for x in r]
+            vols = [x["vol"] for x in r]
+            vma = sum(vols[-21:-1])/20 if len(vols) >= 21 else 0
+            if vma <= 0: continue
+            vx = vols[-1]/vma
+            if vx < 2.0: continue
+            if r[-1]["c"] <= r[-1]["o"]: continue
+            k2 = 2/21; e = closes[0]
+            for vv in closes[1:]: e = vv*k2 + e*(1-k2)
+            if r[-1]["c"] <= e: continue
+            price = r[-1]["c"]
+            trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"])) for i in range(-14, 0)]
+            atr = sum(trs)/len(trs)
+            rd = atr/price
+            if not (0.004 <= rd <= 0.06): continue
+            qty = min((self.cfg.scanner_risk/rd)*equity/price, 5.0*equity/price)
+            qty = max(qty, self.cfg.min_qty_map.get(s, 0), self.cfg.min_notional_usdt/price)
+            if qty*price < 10: continue
+            self.last_scan["signals"] += 1
+            stop = price-atr; target = price+self.cfg.tp_r*atr
+            logging.info(f"VOLUME SURGE {s} ({vx:.1f}x vol) entering at {price:.4f}")
+            notify(f"🔥 <b>VOLUME SURGE · {s}</b>\n{vx:.1f}× volume expansion - entering before the breakout\n"
+                   f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>" + foot())
+            if self.cfg.dry_run:
+                self.log(s, "surge", "BUY", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
+                self.open_pos[f"surge-{s}-{int(time.time()*1000)}"] = {"sym": s, "pnl": 0.0, "kind": "scanner"}
+            else:
+                try:
+                    tick = 0.0001 if price < 10 else 0.1
+                    self.client.place(s, "BUY", qty, "OPEN", stop=stop, target=target, tick=tick)
+                    time.sleep(1); self.sync()
+                    for _pid, _info in self.open_pos.items():
+                        if _info["sym"] == s and "entry" not in _info:
+                            _info.update({"entry": price, "stop": stop, "target": target, "side": 1,
+                                          "kind": "scanner", "qty": qty, "risk_frac": self.cfg.scanner_risk,
+                                          "eq_at_entry": equity})
+                except Exception as ex:
+                    logging.error(f"surge entry failed {s}: {ex}")
+            slots_v -= 1
+            held.add(s)
         armed_now = 0
         for g0, s0 in top[:3]:
             if g0 <= 0: continue
@@ -699,6 +744,12 @@ class Bot:
                 need = (hi - r[-1]['c'])/r[-1]['c']*100 if g0 > 0 else (r[-1]['c'] - lo)/r[-1]['c']*100
                 gate = f"{need:+.1f}% from trigger · vol {vx:.1f}x"
             detail += f"\n📋 {s0.replace('USDT','')} {g0*100:+.1f}%: {gate}"
+        for cs in ("BTCUSDT", "ETHUSDT"):
+            if cs in data:
+                r = data[cs]; nn = 10 if self.cfg.mode == "active" else 20
+                hi = max(x["h"] for x in r[-nn-1:-1]); c0 = r[-1]["c"]
+                bq = (r[-1]["tb"]/r[-1]["vol"]) if r[-1]["vol"] > 0 else 0.5
+                detail += f"\n🅱 {cs.replace('USDT','')}: {(c0/hi-1)*100:+.1f}% from trigger · buyers {bq*100:.0f}%"
         sig = self.last_scan["signals"]
         notify(f"🔎 <b>SCAN</b> — {len(data)} pairs swept\n"
                f"🏆 {tstr}{detail}\n"
