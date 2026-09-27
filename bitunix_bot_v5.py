@@ -773,6 +773,7 @@ class Bot:
                     self.test_trade(sym)
                 elif text == "/status": self.status_report()
                 elif text == "/fire": self.fire_trade()
+                elif text.startswith("/risk"): self.set_risk(text)
                 elif text == "/reset":
                     self.risk.trades = []
                     notify("🔄 Trade record wiped - 0 trades, clean slate. (Deploys also reset it.)")
@@ -944,6 +945,71 @@ class Bot:
                 except Exception as e:
                     logging.error(f"trigger fill failed {t['sym']}: {e}")
 
+    def update_dashboard(self):
+        """One pinned message, always current - the at-a-glance dashboard."""
+        if not (_TG_TOKEN and _TG_CHAT): return
+        try:
+            eq = self.equity()
+            wins = sum(self.risk.trades); n = len(self.risk.trades)
+            wr = f"{wins}/{n} ({wins/n*100:.0f}%)" if n else "awaiting trade #1"
+            chg = (eq/(self.day_start_eq or eq)-1)*100
+            st = streak_of(self.risk.trades)
+            txt = (f"📊 <b>LEVERAGELORD DASHBOARD</b>\n"
+                   f"🏦 Equity <b>${eq:.2f}</b> ({chg:+.1f}% today)\n"
+                   f"📂 {len(self.open_pos)} open · 📝 {n} trades · 🏆 {wr}" + (f" · 🔥{st}" if st>=2 else "") + f"\n"
+                   f"🎯 Target 5%/mo · verdict at 40 trades\n"
+                   f"📈 <code>{sparkline(self.eq_hist)}</code>\n"
+                   f"— live —")
+            if not getattr(self, "dash_id", None):
+                requests.post(f"https://api.telegram.org/bot{_TG_TOKEN}/unpinAllChatMessages",
+                              data={"chat_id": _TG_CHAT}, timeout=10)
+                r = requests.post(f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+                                  data={"chat_id": _TG_CHAT, "text": txt, "parse_mode": "HTML",
+                                        "disable_notification": True}, timeout=10).json()
+                self.dash_id = r.get("result", {}).get("message_id")
+                if self.dash_id:
+                    requests.post(f"https://api.telegram.org/bot{_TG_TOKEN}/pinChatMessage",
+                                  data={"chat_id": _TG_CHAT, "message_id": self.dash_id,
+                                        "disable_notification": True}, timeout=10)
+            else:
+                requests.post(f"https://api.telegram.org/bot{_TG_TOKEN}/editMessageText",
+                              data={"chat_id": _TG_CHAT, "message_id": self.dash_id, "text": txt,
+                                    "parse_mode": "HTML"}, timeout=10)
+        except Exception:
+            pass
+
+
+    RISK_PROFILES = {
+        "low":    {"risk_map": {"ETHUSDT": 0.015, "SOLUSDT": 0.015, "BNBUSDT": 0.0075, "BTCUSDT": 0.005,
+                                 "DOTUSDT": 0.0075, "NEARUSDT": 0.0075}, "scanner_risk": 0.0075, "max_open_risk": 0.04},
+        "medium": {"risk_map": {"ETHUSDT": 0.025, "SOLUSDT": 0.025, "BNBUSDT": 0.0125, "BTCUSDT": 0.0075,
+                                 "DOTUSDT": 0.0125, "NEARUSDT": 0.0125}, "scanner_risk": 0.010, "max_open_risk": 0.05},
+        "high":   {"risk_map": {"ETHUSDT": 0.035, "SOLUSDT": 0.035, "BNBUSDT": 0.0175, "BTCUSDT": 0.010,
+                                 "DOTUSDT": 0.0175, "NEARUSDT": 0.0175}, "scanner_risk": 0.0125, "max_open_risk": 0.07},
+    }
+
+    def set_risk(self, text):
+        parts = text.split()
+        if len(parts) == 1 or parts[1] in ("status", "show"):
+            cur = self.cfg.scanner_risk
+            lvl = {0.0075: "LOW", 0.010: "MEDIUM", 0.0125: "HIGH"}.get(cur, f"custom ({cur*100:.2f}%)")
+            notify(f"🎚 <b>RISK: {lvl}</b>\n"
+                   f"Core {self.cfg.risk_map.get('ETHUSDT',0)*100:.1f}% · Scanner {cur*100:.2f}% · Max open {self.cfg.max_open_risk*100:.0f}%\n"
+                   f"Send /risk low | /risk medium | /risk high to switch" + foot())
+            return
+        lvl = parts[1].lower()
+        if lvl not in self.RISK_PROFILES:
+            notify("🎚 Usage: /risk low · /risk medium · /risk high")
+            return
+        p = self.RISK_PROFILES[lvl]
+        self.cfg.risk_map = dict(p["risk_map"])
+        self.cfg.scanner_risk = p["scanner_risk"]
+        self.cfg.max_open_risk = p["max_open_risk"]
+        logging.info(f"RISK switched to {lvl.upper()} via Telegram")
+        notify(f"🎚 <b>RISK → {lvl.upper()}</b>\n"
+               f"Core {p['risk_map']['ETHUSDT']*100:.1f}% · Scanner {p['scanner_risk']*100:.2f}% · Max open {p['max_open_risk']*100:.0f}%\n"
+               f"Applies to all NEW trades. Note: resets to config default on redeploy." + foot())
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         valid = None if self.cfg.dry_run else self.client.valid_symbols()
@@ -998,6 +1064,7 @@ class Bot:
                                f"📝 {n} trades · 🏆 WR {wr}" + (f" · 🔥{streak_of(self.risk.trades)} win streak" if streak_of(self.risk.trades)>=2 else "") + f"\n"
                                f"📈 <code>{sparkline(self.eq_hist)}</code>" + foot())
                     self.day_start_eq = eq
+                    self.update_dashboard()
                     status = "✅ running" if not (self.risk.halted_today or self.risk.killed) else "⏸ halted"
                     logging.info(f"heartbeat: equity ${eq:.2f} open={len(self.open_pos)} trades={n} status={status}")
                     top3 = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for s, g in self.last_scan.get("top", [])[:3]) or "awaiting first scan"
