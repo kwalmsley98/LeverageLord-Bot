@@ -19,6 +19,7 @@ import os, time, json, hashlib, logging, csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import requests
+import threading
 import math
 
 BASE = "https://fapi.bitunix.com"
@@ -1092,6 +1093,69 @@ class Bot:
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
                 logging.error(f"loop error: {ex}"); time.sleep(60)
+
+
+# ==================== ACCESS BOT (funnel delivery) ====================
+# Runs as a thread if ACCESS_TOKEN is set. Users message the access bot,
+# submit their Bitunix UID, you verify in the partners portal and reply
+# /approve <chat_id> - the bot sends them the file + guide automatically.
+ACCESS_GUIDE = """🤖 Your LeverageLord setup (20 minutes):
+
+1️⃣ Bitunix: create API keys (Profile > API Management) - enable TRADE only, never withdrawals
+2️⃣ Telegram: message @BotFather > /newbot > save the token
+3️⃣ Telegram: message @userinfobot > save your chat ID
+4️⃣ Railway.app: sign up > New Project > Deploy from GitHub > upload this bot file
+5️⃣ Railway > Variables: add BITUNIX_API_KEY, BITUNIX_API_SECRET, TG_TOKEN, TG_CHAT, MODE=active
+6️⃣ Deploy > wait for "LeverageLord is alive" in your Telegram
+
+Commands once live: /status /risk /test /reset /fire /start
+Never share your API secret with anyone. Trade carefully."""
+
+def access_bot_thread():
+    tok = os.getenv("ACCESS_TOKEN", "")
+    if not tok:
+        return
+    offset = 0
+    pending = {}
+    time.sleep(5)
+    while True:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{tok}/getUpdates",
+                             params={"offset": offset, "timeout": 25}, timeout=35).json()
+            for u in r.get("result", []):
+                offset = u["update_id"] + 1
+                msg = u.get("message", {})
+                cid = msg.get("chat", {}).get("id")
+                text = (msg.get("text") or "").strip()
+                if not cid: continue
+                if text.startswith("/start"):
+                    requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                        data={"chat_id": cid, "text": "🤖 LeverageLord access bot.\n\nTo get the trading bot FREE, you need a Bitunix account under our referral.\n\nSend your Bitunix UID (numbers only) and we'll verify it."})
+                elif text.replace(" ", "").isdigit() and 4 <= len(text.replace(" ", "")) <= 12:
+                    uid = text.replace(" ", "")
+                    pending[cid] = uid
+                    requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                        data={"chat_id": int(_TG_CHAT or 0), "text": f"🔔 ACCESS REQUEST\nBitunix UID: {uid}\nchat_id: {cid}\nVerify in partners portal, then reply:\n/approve {cid}"})
+                    requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                        data={"chat_id": cid, "text": "✅ UID received. Verification takes a few minutes - the bot will message you here once approved."})
+                elif text.startswith("/approve") and str(cid) == str(_TG_CHAT):
+                    try:
+                        target = int(text.split()[1])
+                        uid = pending.get(target, "verified")
+                        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                            data={"chat_id": target, "text": f"🎉 Approved! Here is your LeverageLord bot + setup guide:\n\n{ACCESS_GUIDE}"})
+                        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                            data={"chat_id": int(_TG_CHAT), "text": f"✅ Approved UID {uid} (chat {target})"})
+                        del pending[target]
+                    except Exception as e:
+                        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                            data={"chat_id": int(_TG_CHAT), "text": f"approve failed: {e}"})
+        except Exception:
+            time.sleep(5)
+        time.sleep(1)
+
+if __name__ == "__main__":
+    threading.Thread(target=access_bot_thread, daemon=True).start()
 
 if __name__ == "__main__":
     cfg = Config(dry_run=os.getenv("DRY_RUN","true").lower()!="false")
