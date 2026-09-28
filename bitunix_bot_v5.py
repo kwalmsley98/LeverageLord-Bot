@@ -46,7 +46,7 @@ class Config:
     surge_mult: float = field(default_factory=lambda: float(os.getenv("SURGE_MULT", "2.0")))   # volume expansion needed
     trigger_dist: float = field(default_factory=lambda: float(os.getenv("TRIGGER_DIST", "0.02")))  # arming distance from channel
     scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
-    scanner_min_vol24: float = 10_000_000.0   # 24h volume floor (Bitunix-native vol) - 1000PEPE/WIF qualify, 1-7M shrapnel excluded
+    scanner_min_vol24: float = 2_000_000.0   # 24h volume floor (Bitunix-native vol) - 1000PEPE/WIF qualify, 1-7M shrapnel excluded
     scanner_max_pairs: int = 40      # cap on universe size per scan
     scanner_pairs: list = field(default_factory=lambda: ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
                                                           "DOGEUSDT","LINKUSDT","ADAUSDT","LTCUSDT","ARBUSDT","OPUSDT",
@@ -107,6 +107,14 @@ def streak_of(trades):
         else: break
     return s
 
+def binance_klines(symbol, interval="4h", limit=100):
+    """Public Binance klines - the SIGNAL feed. No key needed, deep liquidity, no stale ghosts."""
+    iv = {"1h": "1h", "4h": "4h", "6h": "6h", "1d": "1d"}.get(interval, "4h")
+    r = requests.get("https://api.binance.com/api/v3/klines",
+                     params={"symbol": symbol, "interval": iv, "limit": limit}, timeout=15)
+    return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4]),
+             "t": int(x[0]), "vol": float(x[5]), "tb": float(x[9])} for x in r.json()]
+
 def sparkline(vals, width=24):
     if not vals: return ""
     vals = vals[-width:]
@@ -125,6 +133,7 @@ def fmt_px(p, tick=0.01):
 class BitunixClient:
     def __init__(self, key, secret):
         self.key, self.secret, self.s = key, secret, requests.Session()
+        self._px_cache = {}
     def _sign(self, method, path, body_str, params=None):
         nonce = os.urandom(16).hex(); ts = str(int(time.time()*1000))
         # Bitunix official spec (api-docs/futures/common/sign.html):
@@ -160,6 +169,16 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
+    def ticker_px(self, symbol):
+        now = time.time()
+        c = self._px_cache.get(symbol)
+        if c and now - c[0] < 20:
+            return c[1]
+        rows = self._req("GET", "/api/v1/futures/market/tickers", {"symbol": symbol}) or []
+        px = float(rows[0].get("lastPrice") or 0) if rows else 0.0
+        self._px_cache[symbol] = (now, px)
+        return px
+
     def tickers(self):   # Bitunix 'Get All Tickers' (confirmed path)
         rows = self._req("GET", "/api/v1/futures/market/tickers") or []
         global _TK_DEBUGGED
@@ -410,7 +429,7 @@ class Bot:
         return 0, None, atrv
 
     def run_symbol(self, sym, equity):
-        rows = self.client.klines(sym, self.cfg.interval, 200)
+        rows = binance_klines(sym, self.cfg.interval, 200)
         if len(rows) < self.cfg.ema_trend+5: return
         bar = rows[-2]                                   # last CLOSED bar
         win = rows[-1]["t"]                              # forming bar open == signal bar close time
@@ -524,7 +543,7 @@ class Bot:
         stale = 0
         for s in universe:
             try:
-                rows = self.client.klines(s, self.cfg.interval, 100)
+                rows = binance_klines(s, self.cfg.interval, 100)
                 if len(rows) >= 30:
                     rows = rows[:-1]                          # drop forming bar - closed bars only
                     last_t = rows[-1]["t"]
@@ -533,9 +552,9 @@ class Bot:
                         logging.warning(f"STALE FEED {s}: last candle {last_t} - excluded")
                         continue
                     lp = live_px.get(s)
-                    if lp and abs(rows[-1]["c"] - lp)/lp > 0.03:
+                    if lp and abs(rows[-1]["c"] - lp)/lp > 0.02:
                         stale += 1
-                        logging.warning(f"STALE DATA {s}: kline close {rows[-1]['c']} vs live {lp} - excluded from scan")
+                        logging.warning(f"DIVERGED {s}: Binance {rows[-1]['c']} vs Bitunix {lp} - excluded (exchanges disagree)")
                         continue
                     data[s] = rows
             except Exception:
@@ -872,7 +891,7 @@ class Bot:
             if not info.get("entry") or not info.get("stop") or not info.get("target") or not info.get("qty"):
                 continue
             try:
-                mk = self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
+                mk = self.client.ticker_px(info["sym"]) or self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
             except Exception:
                 continue
             side = info.get("side", 1)
@@ -949,11 +968,10 @@ class Bot:
 
 
     def check_triggers(self):
-        # never fill a trigger on stale prices - verify freshness first
         try:
-            probe = self.client.klines("BTCUSDT", self.cfg.interval, 3)
-            if time.time()*1000 - probe[-1]["t"] > 12*3600e3:
-                logging.warning("STALE FEED - trigger fills paused")
+            b = binance_klines("BTCUSDT", self.cfg.interval, 3)
+            if time.time()*1000 - b[-1]["t"] > 12*3600e3:
+                logging.warning("STALE BINANCE FEED - trigger fills paused")
                 return
         except Exception:
             pass
@@ -964,7 +982,7 @@ class Bot:
             if time.time() > t["expiry"] or t["sym"] in live_syms:
                 self.triggers.remove(t); continue
             try:
-                px = self.client.klines(t["sym"], self.cfg.interval, 1)[-1]["c"]
+                px = self.client.ticker_px(t["sym"]) or self.client.klines(t["sym"], self.cfg.interval, 1)[-1]["c"]
             except Exception:
                 continue
             if t["side"] < 0 and px <= t["level"]:
