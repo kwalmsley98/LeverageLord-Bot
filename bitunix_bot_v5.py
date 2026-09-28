@@ -527,8 +527,13 @@ class Bot:
                 rows = self.client.klines(s, self.cfg.interval, 100)
                 if len(rows) >= 30:
                     rows = rows[:-1]                          # drop forming bar - closed bars only
+                    last_t = rows[-1]["t"]
+                    if time.time()*1000 - last_t > 12*3600e3:     # last candle closed >8h ago = STALE FEED
+                        stale += 1
+                        logging.warning(f"STALE FEED {s}: last candle {last_t} - excluded")
+                        continue
                     lp = live_px.get(s)
-                    if lp and abs(rows[-1]["c"] - lp)/lp > 0.08:
+                    if lp and abs(rows[-1]["c"] - lp)/lp > 0.03:
                         stale += 1
                         logging.warning(f"STALE DATA {s}: kline close {rows[-1]['c']} vs live {lp} - excluded from scan")
                         continue
@@ -944,6 +949,14 @@ class Bot:
 
 
     def check_triggers(self):
+        # never fill a trigger on stale prices - verify freshness first
+        try:
+            probe = self.client.klines("BTCUSDT", self.cfg.interval, 3)
+            if time.time()*1000 - probe[-1]["t"] > 12*3600e3:
+                logging.warning("STALE FEED - trigger fills paused")
+                return
+        except Exception:
+            pass
         """Resting trigger orders: fill when price touches the level (validated +39R/+21R/+7R across windows)."""
         if not self.triggers: return
         live_syms = {i["sym"] for i in self.open_pos.values()}
