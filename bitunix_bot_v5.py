@@ -179,6 +179,19 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
+    def set_leverage(self, symbol, leverage):
+        for path in ["/api/v1/futures/account/leverage", "/api/v1/futures/trade/leverage",
+                     "/api/v1/futures/position/leverage"]:
+            try:
+                self._req("POST", path, payload={"symbol": symbol, "marginCoin": "USDT",
+                                                 "leverage": str(int(leverage))})
+                logging.info(f"leverage set {symbol} {leverage}x")
+                return True
+            except Exception:
+                continue
+        logging.warning(f"set_leverage failed for {symbol} (all paths) - using current setting")
+        return False
+
     def ticker_px(self, symbol):
         now = time.time()
         c = self._px_cache.get(symbol)
@@ -305,6 +318,14 @@ class BitunixClient:
                  "orderType":order_type,"effect":"GTC","clientId":str(int(time.time()*1000)),
                  "reduceOnly": trade_side=="CLOSE"}
         if order_type=="LIMIT": payload["price"]=fmt_px(price,tick)
+        if trade_side == "OPEN" and stop and target:
+            try:
+                atr = abs(target - stop) / 3.5
+                entry_est = (stop + atr) if side == "BUY" else (stop - atr)
+                stop_pct = atr / max(entry_est, 1e-9)
+                self.set_leverage(symbol, max(5, min(25, int(0.9 / (3 * stop_pct)))))
+            except Exception as e:
+                logging.warning(f"auto-leverage skipped: {e}")
         if trade_side=="OPEN" and stop and target:
             try:   # clamp bracket against a FRESH mark price - fast markets can invalidate it
                 mk = self.klines(symbol, self.cfg.interval, 1)[-1]["c"]
@@ -1199,15 +1220,17 @@ class Bot:
 # /approve <chat_id> - the bot sends them the file + guide automatically.
 ACCESS_GUIDE = """🤖 Your LeverageLord setup (20 minutes):
 
+0️⃣ Download the bot file: https://raw.githubusercontent.com/kwalmsley98/LeverageLord-Bot/main/bitunix_bot_v5.py
 1️⃣ Bitunix: create API keys (Profile > API Management) - enable TRADE only, never withdrawals
 2️⃣ Telegram: message @BotFather > /newbot > save the token
 3️⃣ Telegram: message @userinfobot > save your chat ID
-4️⃣ Railway.app: sign up > New Project > Deploy from GitHub > upload this bot file
+4️⃣ Railway.app: sign up > New Project > Deploy from GitHub > upload the bot file (or push it to your own repo)
 5️⃣ Railway > Variables: add BITUNIX_API_KEY, BITUNIX_API_SECRET, TG_TOKEN, TG_CHAT, MODE=active
 6️⃣ Deploy > wait for "LeverageLord is alive" in your Telegram
 
-Commands once live: /status /risk /test /reset /fire /start
-Never share your API secret with anyone. Trade carefully."""
+Start with DRY_RUN=true for a day to watch it, then go live small.
+Commands once live: /start /status /risk /test /reset /fire
+Never share your API secret with anyone. Trading involves risk - start small."""
 
 def access_bot_thread():
     tok = os.getenv("ACCESS_TOKEN", "")
