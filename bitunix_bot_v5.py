@@ -179,6 +179,15 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
+    def flash_close(self, position_id):
+        for path in ["/api/v1/futures/trade/flash_close_position",
+                     "/api/v1/futures/position/flash_close_position"]:
+            try:
+                return self._req("POST", path, payload={"positionId": str(position_id)})
+            except Exception:
+                continue
+        raise RuntimeError("flash_close failed on all paths")
+
     def set_leverage(self, symbol, leverage):
         for path in ["/api/v1/futures/account/leverage", "/api/v1/futures/trade/leverage",
                      "/api/v1/futures/position/leverage"]:
@@ -212,7 +221,10 @@ class BitunixClient:
         for t in rows:
             sym = t.get("symbol", "")
             vol = float(t.get("vol") or t.get("volume") or t.get("vol24h") or t.get("turnover") or t.get("amount") or t.get("quoteVol") or 0)
-            out.append({"symbol": sym, "vol24": vol})
+            out.append({"symbol": sym, "vol24": vol,
+                        "lastPrice": float(t.get("lastPrice") or 0),
+                        "markPrice": float(t.get("markPrice") or 0),
+                        "open": float(t.get("open") or 0)})
         return out
 
     def valid_symbols(self):
@@ -273,14 +285,16 @@ class BitunixClient:
                                 "side":1 if p.get("side")=="LONG" else -1, "qty":q})
         return out
     def cancel(self, symbol, order_id):
-        for path in ["/api/v1/futures/trade/cancel_order",
-                     "/api/v1/futures/order/cancel_order"]:
+        for path, payload in [
+                ("/api/v1/futures/trade/cancel_orders", {"symbol": symbol, "orderList": [str(order_id)]}),
+                ("/api/v1/futures/trade/cancel_order", {"symbol": symbol, "orderId": str(order_id)}),
+                ("/api/v1/futures/order/cancel_order", {"symbol": symbol, "orderId": str(order_id)})]:
             try:
-                return self._req("POST", path, payload={"symbol": symbol, "orderId": str(order_id)})
+                return self._req("POST", path, payload=payload)
             except Exception:
                 continue
     def place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
-              stop=None, target=None, tick=0.1):
+              stop=None, target=None, tick=0.1, position_id=None):
         # returns ("bracket"|"plain", result).
         # OPEN orders: auto-retry qty at every valid precision (0.001 -> 1.0), then fall back to plain.
         if trade_side == "OPEN":
@@ -317,6 +331,8 @@ class BitunixClient:
         payload={"symbol":symbol,"side":side,"qty":fmt_qty(qty),"tradeSide":trade_side,
                  "orderType":order_type,"effect":"GTC","clientId":str(int(time.time()*1000)),
                  "reduceOnly": trade_side=="CLOSE"}
+        if position_id:
+            payload["positionId"] = str(position_id)
         if order_type=="LIMIT": payload["price"]=fmt_px(price,tick)
         if trade_side == "OPEN" and stop and target:
             try:
@@ -494,7 +510,7 @@ class Bot:
             if info["sym"]==sym:
                 if not self.cfg.dry_run:
                     p=[x for x in self.client.positions(sym) if x["id"]==pid]
-                    if p: self.client.place(sym, "SELL" if p[0]["side"]>0 else "BUY", p[0]["qty"], "CLOSE")
+                    if p: self.client.place(sym, "SELL" if p[0]["side"]>0 else "BUY", p[0]["qty"], "CLOSE", position_id=p[0]["id"])
                 self.log(sym,"EXIT","","","","","","flip"); del self.open_pos[pid]; self.entry_info.pop(sym,None)
         self.state[sym]=0
         if new_side==0: return
@@ -547,7 +563,7 @@ class Bot:
             if _info["sym"]==sym and "entry" not in _info:
                 _info.update({"entry":price,"stop":stop,"target":target,"side":new_side,"kind":kind,"qty":qty,"risk_frac":risk,"eq_at_entry":equity})
         self.state[sym]=new_side
-        self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd,"stop":stop,"side":new_side}
+        self.entry_info[sym]={"entry":price,"kind":kind,"stop_pct":rd,"stop":stop,"side":new_side,"risk":risk}
 
 
     def run_scanner(self, equity):
@@ -939,7 +955,11 @@ class Bot:
             R = (exit_p - info["entry"]) / abs(info["entry"] - info["stop"]) * side
             try:
                 close_side = "SELL" if side > 0 else "BUY"
-                self.client.place(info["sym"], close_side, info["qty"], "CLOSE")
+                try:
+                    self.client.place(info["sym"], close_side, info["qty"], "CLOSE", position_id=pid)
+                except Exception as e1:
+                    logging.warning(f"close with positionId failed ({e1}) - trying flash_close")
+                    self.client.flash_close(pid)
                 logging.info(f"MANAGED EXIT {info['sym']} at {exit_p:.4f} (R={R:+.2f})")
             except Exception as e:
                 logging.error(f"managed exit failed {info['sym']}: {e}")
@@ -1189,15 +1209,15 @@ class Bot:
                     self.eq_hist.append(eq); self.eq_hist = self.eq_hist[-168:]
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     if today != self.day_stamp:
-                        self.day_stamp = today
                         base = self.day_start_eq or eq
+                        self.day_start_eq = eq
+                        self.day_stamp = today
                         chg = (eq/base-1)*100 if base else 0
                         c = "🟢" if chg>=0 else "🔴"
                         notify(f"📅 <b>DAILY SUMMARY · {today}</b>\n"
                                f"🏦 Equity <b>${eq:.2f}</b> ({c}{chg:+.1f}% today)\n"
                                f"📝 {n} trades · 🏆 WR {wr}" + (f" · 🔥{streak_of(self.risk.trades)} win streak" if streak_of(self.risk.trades)>=2 else "") + f"\n"
                                f"📈 <code>{sparkline(self.eq_hist)}</code>" + foot())
-                    self.day_start_eq = eq
                     self.update_dashboard()
                     status = "✅ running" if not (self.risk.halted_today or self.risk.killed) else "⏸ halted"
                     logging.info(f"heartbeat: equity ${eq:.2f} open={len(self.open_pos)} trades={n} status={status}")
@@ -1225,7 +1245,7 @@ ACCESS_GUIDE = """🤖 Your LeverageLord setup (20 minutes):
 2️⃣ Telegram: message @BotFather > /newbot > save the token
 3️⃣ Telegram: message @userinfobot > save your chat ID
 4️⃣ Railway.app: sign up > New Project > Deploy from GitHub > upload the bot file (or push it to your own repo)
-5️⃣ Railway > Variables: add BITUNIX_API_KEY, BITUNIX_API_SECRET, TG_TOKEN, TG_CHAT, MODE=active
+5️⃣ Railway > Variables: add BITUNIX_API_KEY, BITUNIX_API_SECRET, TG_TOKEN, TG_CHAT, MODE=strict
 6️⃣ Deploy > wait for "LeverageLord is alive" in your Telegram
 
 Start with DRY_RUN=true for a day to watch it, then go live small.
