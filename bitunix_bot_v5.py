@@ -54,7 +54,7 @@ class Config:
     scanner_risk: float = 0.0125     # per top-gainer trade (validated two windows)
     scanner_max: int = 2             # max concurrent scanner positions
     scanner_ret: float = 0.04        # min 24-bar gain to qualify
-    entry_limit: bool = True        # lever 1: maker-limit entries (free ~+0.5-1%/mo)
+    entry_limit: bool = False       # market entries on breakouts (limit entries miss the move)
     limit_offset: float = 0.0005    # place limit 0.05% better than signal price
     entry_timeout_bars: int = 2     # bars to wait for fill, then cancel
     interval: str = "4h"
@@ -108,12 +108,22 @@ def streak_of(trades):
     return s
 
 def binance_klines(symbol, interval="4h", limit=100):
-    """Public Binance klines - the SIGNAL feed. No key needed, deep liquidity, no stale ghosts."""
+    """Public market data from Binance's geo-safe data endpoint (no key, no US block)."""
     iv = {"1h": "1h", "4h": "4h", "6h": "6h", "1d": "1d"}.get(interval, "4h")
-    r = requests.get("https://api.binance.com/api/v3/klines",
-                     params={"symbol": symbol, "interval": iv, "limit": limit}, timeout=15)
-    return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4]),
-             "t": int(x[0]), "vol": float(x[5]), "tb": float(x[9])} for x in r.json()]
+    cands = [symbol] + ([symbol[4:]] if symbol.startswith("1000") else [])
+    last_err = "no response"
+    for cand in cands:
+        try:
+            r = requests.get("https://data-api.binance.vision/api/v3/klines",
+                             params={"symbol": cand, "interval": iv, "limit": limit}, timeout=15)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4]),
+                     "t": int(x[0]), "vol": float(x[5]), "tb": float(x[9])} for x in r.json()]
+        except Exception as e:
+            last_err = str(e)
+    raise RuntimeError(f"binance klines failed for {symbol}: {last_err}")
 
 def sparkline(vals, width=24):
     if not vals: return ""
@@ -429,7 +439,11 @@ class Bot:
         return 0, None, atrv
 
     def run_symbol(self, sym, equity):
-        rows = binance_klines(sym, self.cfg.interval, 200)
+        try:
+            rows = binance_klines(sym, self.cfg.interval, 200)
+        except Exception as e:
+            logging.warning(f"BINANCE FEED DOWN ({e}) - falling back to Bitunix klines for {sym}")
+            rows = self.client.klines(sym, self.cfg.interval, 200)
         if len(rows) < self.cfg.ema_trend+5: return
         bar = rows[-2]                                   # last CLOSED bar
         win = rows[-1]["t"]                              # forming bar open == signal bar close time
@@ -485,7 +499,6 @@ class Bot:
                f"⚖️ 1 : {rr:.1f} · 📊 Risk {risk*100:.2f}% · Size ~${qty*price:.0f}" + foot())
         if self.cfg.dry_run:
             self.log(sym, kind, side, fmt_qty(qty), f"{stop:.2f}", f"{target:.2f}", "", "DRY_RUN")
-            self.open_pos[f"dry-{sym}-{int(time.time()*1000)}"]={"sym":sym,"pnl":0.0}
         else:
             filled = False
             if self.cfg.entry_limit:
@@ -493,8 +506,8 @@ class Bot:
                 _mode, res = self.client.place(sym, side, qty, "OPEN", order_type="LIMIT", price=lim,
                                                stop=stop, target=target)
                 oid = (res or {}).get("orderId") or (res or {}).get("id")
-                for _ in range(self.cfg.entry_timeout_bars*60):
-                    time.sleep(60)
+                for _ in range(self.cfg.entry_timeout_bars):
+                    time.sleep(30)
                     self.sync()
                     if any(i["sym"]==sym for i in self.open_pos.values()):
                         filled = True; logging.info(f"{sym}: limit filled at maker fee"); break
@@ -527,9 +540,9 @@ class Bot:
         if self.cfg.scanner_dynamic:
             try:
                 tk = self.client.tickers()
-                dyn = [t["symbol"] for t in tk
-                       if t["symbol"].endswith("USDT") and t["vol24"] >= self.cfg.scanner_min_vol24]
-                dyn = [s for s in dyn if s not in self.cfg.symbols or True][:self.cfg.scanner_max_pairs]
+                pool = sorted((t for t in tk if t["symbol"].endswith("USDT") and t["vol24"] >= self.cfg.scanner_min_vol24),
+                              key=lambda t: -t["vol24"])
+                dyn = [t["symbol"] for t in pool[:self.cfg.scanner_max_pairs]]
                 if dyn: universe = dyn
                 else: logging.warning("dynamic universe empty - using fallback list")
             except Exception as e:
@@ -543,7 +556,11 @@ class Bot:
         stale = 0
         for s in universe:
             try:
-                rows = binance_klines(s, self.cfg.interval, 100)
+                try:
+                    rows = binance_klines(s, self.cfg.interval, 100)
+                except Exception as e:
+                    logging.warning(f"BINANCE FEED DOWN ({e}) - Bitunix fallback for {s}")
+                    rows = self.client.klines(s, self.cfg.interval, 100)
                 if len(rows) >= 30:
                     rows = rows[:-1]                          # drop forming bar - closed bars only
                     last_t = rows[-1]["t"]
@@ -569,7 +586,7 @@ class Bot:
         top.sort(reverse=True)
         self.last_scan = {"top": [(s, g) for g, s in top[:5]], "universe": len(data), "signals": 0}
         tstr = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for g, s in top[:5]) or "n/a"
-        logging.info(f"scanner universe: {len(data)} pairs | top24h: {tstr}")
+        logging.info(f"scanner universe: {len(data)} pairs | top4d: {tstr}")
         logging.info(f"SCAN REPORT | universe {len(data)} | top: {tstr} | signals queued: 0")
         held = {info["sym"] for info in self.open_pos.values()}
         cands = []
@@ -610,12 +627,11 @@ class Bot:
             self.last_scan["signals"] += 1
             logging.info(f"SCANNER ENTER {s} (24h +{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
             rd = abs(price-stop)/price*100
-            notify(f"🚀 <b>SCANNER · {s}</b> 🔥 +{ret24*100:.1f}%/24h\n"
+            notify(f"🚀 <b>SCANNER · {s}</b> 🔥 +{ret24*100:.1f}%/4d\n"
                    f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> (−{rd:.1f}%) · 🎯 <code>{target:.4f}</code>\n"
                    f"📊 Risk {self.cfg.scanner_risk*100:.1f}%" + foot())
             if self.cfg.dry_run:
                 self.log(s, "scanner", "BUY", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
-                self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym":s, "pnl":0.0, "kind":"scanner"}
             else:
                 try:
                     self.client.place(s, "BUY", qty, "OPEN", stop=stop, target=target, tick=0.0001)
@@ -664,7 +680,7 @@ class Bot:
                 continue
             self.last_scan["signals"] += 1
             logging.info(f"SCANNER SHORT {s} (24h -{ret24*100:.1f}%) qty={fmt_qty(qty)} stop={stop:.4f} tgt={target:.4f}")
-            notify(f"🔻 <b>SCANNER SHORT · {s}</b> 📉 −{ret24*100:.1f}%/24h\n"
+            notify(f"🔻 <b>SCANNER SHORT · {s}</b> 📉 −{ret24*100:.1f}%/4d\n"
                    f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>\n"
                    f"📊 Risk {self.cfg.scanner_risk*100:.1f}%" + foot())
             if self.cfg.dry_run:
@@ -711,7 +727,6 @@ class Bot:
                    f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>" + foot())
             if self.cfg.dry_run:
                 self.log(s, "surge", "BUY", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
-                self.open_pos[f"surge-{s}-{int(time.time()*1000)}"] = {"sym": s, "pnl": 0.0, "kind": "scanner"}
             else:
                 try:
                     tick = 0.0001 if price < 10 else 0.1
