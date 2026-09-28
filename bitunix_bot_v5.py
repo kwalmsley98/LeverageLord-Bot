@@ -43,6 +43,8 @@ class Config:
     mode: str = field(default_factory=lambda: os.getenv("MODE", "strict").lower())
     #   strict = validated gates (positive in ALL tested regimes - recommended)
     #   active = looser gates (~40% more trades, regime-dependent edge - your call)
+    surge_mult: float = field(default_factory=lambda: float(os.getenv("SURGE_MULT", "2.0")))   # volume expansion needed
+    trigger_dist: float = field(default_factory=lambda: float(os.getenv("TRIGGER_DIST", "0.02")))  # arming distance from channel
     scanner_dynamic: bool = True     # build universe from ALL Bitunix perps (volume-filtered)
     scanner_min_vol24: float = 10_000_000.0   # 24h volume floor (Bitunix-native vol) - 1000PEPE/WIF qualify, 1-7M shrapnel excluded
     scanner_max_pairs: int = 40      # cap on universe size per scan
@@ -665,7 +667,7 @@ class Bot:
             vma = sum(vols[-21:-1])/20 if len(vols) >= 21 else 0
             if vma <= 0: continue
             vx = vols[-1]/vma
-            if vx < 2.0: continue
+            if vx < self.cfg.surge_mult: continue
             if r[-1]["c"] <= r[-1]["o"]: continue
             k2 = 2/21; e = closes[0]
             for vv in closes[1:]: e = vv*k2 + e*(1-k2)
@@ -708,7 +710,7 @@ class Bot:
             n = 10 if self.cfg.mode == "active" else 20
             hi = max(x["h"] for x in r[-n-1:-1])
             need = (hi - r[-1]["c"]) / r[-1]["c"]
-            if 0 < need <= 0.02 and s0 not in {t["sym"] for t in self.triggers} and s0 not in held:
+            if 0 < need <= self.cfg.trigger_dist and s0 not in {t["sym"] for t in self.triggers} and s0 not in held:
                 price = r[-1]["c"]
                 trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"])) for i in range(-14, 0)]
                 atr = sum(trs)/len(trs)
