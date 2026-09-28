@@ -179,6 +179,44 @@ class BitunixClient:
         return [{"o":float(r["open"]), "h":float(r["high"]), "l":float(r["low"]),
                  "c":float(r["close"]), "t":int(r["time"]),
                  "vol":float(r.get("vol",0)), "tb":float(r.get("takerVol", r.get("takerBuyVol",0) or 0))} for r in rows]
+    def trading_spec(self, symbol):
+        """Exchange-native quantity/price constraints (v5.1 audit improvement)."""
+        try:
+            data = self._req("GET", "/api/v1/futures/market/trading_pairs", {"symbols": symbol}) or []
+            row = data[0] if isinstance(data, list) and data else {}
+            return {"min_qty": float(row.get("minTradeVolume") or 0),
+                    "qty_precision": int(row.get("basePrecision") or 6),
+                    "px_precision": int(row.get("quotePrecision") or 8),
+                    "max_market_qty": float(row.get("maxMarketOrderVolume") or 0)}
+        except Exception:
+            return None
+
+    def normalize_qty(self, symbol, qty):
+        """Pre-fit qty to exchange rules; ladder remains as the safety net."""
+        try:
+            sp = self.trading_spec(symbol)
+            if not sp: return qty
+            step = 10 ** (-max(0, sp["qty_precision"]))
+            q = math.floor(float(qty) / step + 1e-12) * step
+            q = max(q, sp["min_qty"] or 0)
+            if sp["max_market_qty"] > 0: q = min(q, sp["max_market_qty"])
+            return q
+        except Exception:
+            return qty
+
+    def history_position(self, position_id):
+        """Realized PnL/funding/fees for a closed position (v5.1 audit improvement)."""
+        try:
+            data = self._req("GET", "/api/v1/futures/position/get_history_positions",
+                             {"positionId": str(position_id), "limit": 10}) or {}
+            rows = data.get("positionList", []) if isinstance(data, dict) else (data or [])
+            for row in rows:
+                if str(row.get("positionId")) == str(position_id):
+                    return row
+        except Exception:
+            pass
+        return None
+
     def flash_close(self, position_id):
         for path in ["/api/v1/futures/trade/flash_close_position",
                      "/api/v1/futures/position/flash_close_position"]:
@@ -404,9 +442,18 @@ class Bot:
         for pid,info in list(self.open_pos.items()):
             if pid not in live:
                 R = None
-                if info.get("entry") and info.get("stop"):
+                if info.get("eq_at_entry") and info.get("risk_frac"):
                     try:
-                        mk = self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
+                        hp = self.client.history_position(pid)
+                        if hp:
+                            net = float(hp.get("realizedPNL") or 0) + float(hp.get("funding") or 0) - abs(float(hp.get("fee") or 0))
+                            rd_ = float(info["eq_at_entry"]) * float(info["risk_frac"])
+                            if rd_ > 0: R = net / rd_
+                    except Exception as e:
+                        logging.warning(f"history lookup failed for {pid}: {e}")
+                if R is None and info.get("entry") and info.get("stop"):
+                    try:
+                        mk = self.client.ticker_px(info["sym"]) or self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
                         R = (mk-info["entry"])/abs(info["entry"]-info["stop"])*info.get("side",1)
                     except Exception:
                         R = None
