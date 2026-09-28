@@ -344,7 +344,7 @@ class BitunixClient:
                 logging.warning(f"auto-leverage skipped: {e}")
         if trade_side=="OPEN" and stop and target:
             try:   # clamp bracket against a FRESH mark price - fast markets can invalidate it
-                mk = self.klines(symbol, self.cfg.interval, 1)[-1]["c"]
+                mk = self.klines(symbol, "4h", 1)[-1]["c"]   # client has no cfg - bot is 4h native
                 if side == "BUY":
                     target = max(target, mk*1.002); stop = min(stop, mk*0.998)
                 else:
@@ -722,7 +722,10 @@ class Bot:
                    f"📊 Risk {self.cfg.scanner_risk*100:.1f}%" + foot())
             if self.cfg.dry_run:
                 self.log(s, "scanner-short", "SELL", fmt_qty(qty), f"{stop:.4f}", f"{target:.4f}", "", "DRY_RUN")
-                self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym":s, "pnl":0.0, "kind":"scanner", "side":-1}
+                eq = equity
+                self.open_pos[f"scan-{s}-{int(time.time()*1000)}"] = {"sym": s, "pnl": 0.0, "kind": "scanner",
+                    "side": -1, "entry": price, "stop": stop, "target": target, "qty": qty,
+                    "risk_frac": self.cfg.scanner_risk, "eq_at_entry": eq}
             else:
                 try:
                     self.client.place(s, "SELL", qty, "OPEN", stop=stop, target=target, tick=0.0001)
@@ -947,6 +950,15 @@ class Bot:
             except Exception:
                 continue
             side = info.get("side", 1)
+            # +1R break-even ratchet: once up 1R, stop moves to entry (Grok audit - biggest expectancy lever)
+            rd1 = abs(info["entry"] - info.get("be_from", info["stop"]))
+            if not info.get("be_done") and rd1 > 0:
+                if (side > 0 and mk >= info["entry"] + rd1) or (side < 0 and mk <= info["entry"] - rd1):
+                    info["be_from"] = info["stop"]
+                    info["stop"] = info["entry"] * (1.001 if side > 0 else 0.999)
+                    info["be_done"] = True
+                    logging.info(f"BE-RATCHET {info['sym']}: +1R reached, stop -> break-even")
+                    notify(f"🔒 <b>{info['sym']}</b>: +1R reached - stop moved to break-even")
             hit_stop = mk <= info["stop"] if side > 0 else mk >= info["stop"]
             hit_tgt  = mk >= info["target"] if side > 0 else mk <= info["target"]
             if not (hit_stop or hit_tgt):
