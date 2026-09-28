@@ -727,6 +727,35 @@ class Bot:
                         notify(f"⚡ <b>TRIGGER ARMED · {s0}</b>\n"
                                f"fills if price touches <code>{hi*1.001:.4f}</code>\n"
                                f"🛑 <code>{hi*1.001-atr:.4f}</code> · 🎯 <code>{hi*1.001+self.cfg.tp_r*atr:.4f}</code> · risk {self.cfg.scanner_risk*100:.1f}%" + foot())
+        # MAJORS always get triggers when near their level - deep books actually fill
+        for cs in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"):
+            if cs not in data or cs in held or cs in {t["sym"] for t in self.triggers}: continue
+            r = data[cs]
+            n = 10 if self.cfg.mode == "active" else 20
+            hi = max(x["h"] for x in r[-n-1:-1]); lo = min(x["l"] for x in r[-n-1:-1])
+            c0 = r[-1]["c"]
+            for side, lvl, need in ((1, hi*1.001, (hi-c0)/c0), (-1, lo*0.999, (c0-lo)/c0)):
+                if 0 < need <= self.cfg.trigger_dist:
+                    trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"])) for i in range(-14, 0)]
+                    atr = sum(trs)/len(trs)
+                    rd = atr/c0
+                    if not (0.004 <= rd <= 0.06): continue
+                    eq = equity
+                    qty = min((self.cfg.scanner_risk/rd)*eq/c0, 5.0*eq/c0)
+                    qty = max(qty, self.cfg.min_qty_map.get(cs, 0), self.cfg.min_notional_usdt/c0)
+                    if qty*c0 < 10: continue
+                    if side > 0:
+                        self.triggers.append({"sym": cs, "side": 1, "level": lvl, "stop": lvl-atr,
+                                              "target": lvl+self.cfg.tp_r*atr, "qty": qty, "expiry": time.time()+8*3600})
+                        nm = f"⚡ <b>TRIGGER ARMED · {cs}</b>\nfills if price touches <code>{lvl:.2f}</code>\n🛑 <code>{lvl-atr:.2f}</code> · 🎯 <code>{lvl+self.cfg.tp_r*atr:.2f}</code> · risk {self.cfg.scanner_risk*100:.1f}%"
+                    else:
+                        self.triggers.append({"sym": cs, "side": -1, "level": lvl, "stop": lvl+atr,
+                                              "target": lvl-self.cfg.tp_r*atr, "qty": qty, "expiry": time.time()+8*3600})
+                        nm = f"⚡ <b>SHORT TRIGGER · {cs}</b>\nfills if price touches <code>{lvl:.2f}</code>\n🛑 <code>{lvl+atr:.2f}</code> · 🎯 <code>{lvl-self.cfg.tp_r*atr:.2f}</code> · risk {self.cfg.scanner_risk*100:.1f}%"
+                    armed_now += 1
+                    logging.info(f"MAJOR TRIGGER ARMED: {cs} side={side} level={lvl}")
+                    notify(nm + foot())
+                    break
         if armed_now:
             logging.info(f"TRIGGERS ARMED: {[t['sym'] for t in self.triggers]}")
         detail = ""
@@ -924,6 +953,27 @@ class Bot:
             try:
                 px = self.client.klines(t["sym"], self.cfg.interval, 1)[-1]["c"]
             except Exception:
+                continue
+            if t["side"] < 0 and px <= t["level"]:
+                atr = t["stop"] - t["level"]
+                if px <= t["level"] - 1.5*atr:
+                    logging.warning(f"TRIGGER GAP-SKIP SHORT {t['sym']}")
+                    notify(f"⏭ <b>{t['sym']}</b> gapped through the short trigger - skipped")
+                    self.triggers.remove(t); continue
+                stop = px + 1.0*atr; target = px - self.cfg.tp_r*atr
+                try:
+                    tick = 0.0001 if px < 10 else 0.1
+                    self.client.place(t["sym"], "SELL", t["qty"], "OPEN", stop=stop, target=target, tick=tick)
+                    time.sleep(1); self.sync()
+                    for pid, info in self.open_pos.items():
+                        if info["sym"] == t["sym"] and "entry" not in info:
+                            info.update({"entry": px, "stop": stop, "target": target, "side": -1, "kind": "scanner",
+                                         "qty": t["qty"], "risk_frac": self.cfg.scanner_risk, "eq_at_entry": self.equity()})
+                    logging.info(f"TRIGGER FILLED SHORT {t['sym']} at {px:.4f}")
+                    notify(f"🔻 <b>TRIGGER FILLED SHORT · {t['sym']}</b>\n📍 <code>{px:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>" + foot())
+                    self.triggers.remove(t)
+                except Exception as e:
+                    logging.error(f"trigger short fill failed {t['sym']}: {e}")
                 continue
             if t["side"] > 0 and px >= t["level"]:
                 atr = t["level"] - t["stop"]          # original 1x ATR
