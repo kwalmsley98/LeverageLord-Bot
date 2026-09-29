@@ -353,14 +353,14 @@ class BitunixClient:
                 q2 = math.floor(qty/st)*st
                 if q2 <= 0: q2 = st
                 try:
-                    return ("bracket", self._place(symbol, side, q2, trade_side, order_type, price, stop, target, tick))
+                    return ("bracket", self._place(symbol, side, q2, trade_side, order_type, price, stop, target, tick, position_id=position_id))
                 except Exception as e:
                     last_e = e
                     if "10002" in str(e):
                         continue                      # wrong qty precision -> next step
                     logging.warning(f"bracket rejected ({e}) - trying plain order")
                     try:
-                        return ("plain", self._place(symbol, side, q2, trade_side, order_type, price, None, None, tick))
+                        return ("plain", self._place(symbol, side, q2, trade_side, order_type, price, None, None, tick, position_id=position_id))
                     except Exception as e2:
                         last_e = e2
                         if "10002" in str(e2):
@@ -368,15 +368,15 @@ class BitunixClient:
                         raise
             raise last_e
         try:
-            return ("bracket", self._place(symbol, side, qty, trade_side, order_type, price, stop, target, tick))
+            return ("bracket", self._place(symbol, side, qty, trade_side, order_type, price, stop, target, tick, position_id=position_id))
         except Exception as e:
             if "place_order" in str(e):
                 logging.warning(f"bracket rejected ({e}) - placing plain order, bot will manage exit")
-                return ("plain", self._place(symbol, side, qty, trade_side, order_type, price, None, None, tick))
+                return ("plain", self._place(symbol, side, qty, trade_side, order_type, price, None, None, tick, position_id=position_id))
             raise
 
     def _place(self, symbol, side, qty, trade_side, order_type="MARKET", price=None,
-               stop=None, target=None, tick=0.1):
+               stop=None, target=None, tick=0.1, position_id=None):
         payload={"symbol":symbol,"side":side,"qty":fmt_qty(qty),"tradeSide":trade_side,
                  "orderType":order_type,"effect":"GTC","clientId":str(int(time.time()*1000)),
                  "reduceOnly": trade_side=="CLOSE"}
@@ -439,6 +439,7 @@ class Bot:
         self.tg_offset = 0
         self.triggers = []   # [{sym, side, level, stop, target, qty, expiry}]
         self.last_scan = {"top": [], "universe": 0, "signals": 0}
+        self.scan_data = {}
         self.eq_hist = []
         self.day_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.day_start_eq = None
@@ -668,7 +669,8 @@ class Bot:
                         logging.warning(f"STALE FEED {s}: last candle {last_t} - excluded")
                         continue
                     lp = live_px.get(s)
-                    if lp and abs(rows[-1]["c"] - lp)/lp > 0.02:
+                    scale = 1000.0 if s.startswith("1000") else 1.0   # 1000PEPE = 1000x token scale vs Binance spot
+                    if lp and abs(rows[-1]["c"]*scale - lp)/lp > 0.02:
                         stale += 1
                         logging.warning(f"DIVERGED {s}: Binance {rows[-1]['c']} vs Bitunix {lp} - excluded (exchanges disagree)")
                         continue
@@ -687,6 +689,7 @@ class Bot:
         tstr = " · ".join(f"{s.replace('USDT','')} {g*100:+.1f}%" for g, s in top[:5]) or "n/a"
         logging.info(f"scanner universe: {len(data)} pairs | top4d: {tstr}")
         logging.info(f"SCAN REPORT | universe {len(data)} | top: {tstr} | signals queued: 0")
+        self.scan_data = data
         held = {info["sym"] for info in self.open_pos.values()}
         cands = []
         for s, r in data.items():
@@ -1252,6 +1255,62 @@ class Bot:
         lines.append(f"mode {self.cfg.mode} · poll {self.cfg.poll_seconds}s")
         notify("<b>SELF-CHECK</b>\n" + "\n".join(lines))
 
+
+    def check_intrabar_surge(self):
+        """Mid-bar volume-shift entries: forming candle's volume pace vs average, checked every poll.
+        Fires on the volume increase the user asked for - no waiting for the 4h close."""
+        if not self.scan_data: return
+        if self.open_risk() + self.cfg.scanner_risk > self.cfg.max_open_risk: return
+        held = {i["sym"] for i in self.open_pos.values()} | {t["sym"] for t in self.triggers}
+        watch = [s for g, s in self.last_scan.get("top", [])[:4] if g > 0] + ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        iv = INTERVAL_MS.get(self.cfg.interval, 14400e3)
+        for s in dict.fromkeys(watch):
+            if s in held or s not in self.scan_data: continue
+            r = self.scan_data[s]
+            try:
+                cur = binance_klines(s, self.cfg.interval, 1)   # forming bar
+                bar = cur[-1]
+            except Exception:
+                continue
+            elapsed = min(max((time.time()*1000 - bar["t"]) / iv, 0.05), 1.0)
+            vols = [x["vol"] for x in r[-21:-1]]
+            vma = sum(vols)/len(vols) if vols else 0
+            if vma <= 0: continue
+            pace = bar["vol"] / (elapsed * vma)
+            if pace < 1.5: continue                              # volume running >=1.5x normal pace
+            if bar["c"] <= bar["o"]: continue                    # must be a green shift
+            closes = [x["c"] for x in r]
+            k2 = 2/21; e = closes[0]
+            for v in closes[1:]: e = v*k2 + e*(1-k2)
+            if bar["c"] <= e: continue                           # above short-term trend
+            price = bar["c"]
+            trs = [max(r[i]["h"]-r[i]["l"], abs(r[i]["h"]-r[i-1]["c"]), abs(r[i]["l"]-r[i-1]["c"])) for i in range(-14, 0)]
+            atr = sum(trs)/len(trs)
+            rd = atr/price
+            if not (0.004 <= rd <= 0.06): continue
+            eq = self.equity()
+            qty = min((self.cfg.scanner_risk/rd)*eq/price, 5.0*eq/price)
+            qty = max(qty, self.cfg.min_qty_map.get(s, 0), self.cfg.min_notional_usdt/price)
+            if qty*price < 10: continue
+            stop = price - atr; target = price + self.cfg.tp_r*atr
+            self.last_scan["signals"] += 1
+            logging.info(f"INTRABAR SURGE {s} pace {pace:.1f}x entering at {price:.4f}")
+            notify(f"🔥 <b>INTRABAR SURGE · {s}</b>\n{pace:.1f}× volume pace mid-bar - entering on the shift\n"
+                   f"📍 <code>{price:.4f}</code> · 🛑 <code>{stop:.4f}</code> · 🎯 <code>{target:.4f}</code>" + foot())
+            try:
+                tick = 0.0001 if price < 10 else 0.1
+                self.client.place(s, "BUY", qty, "OPEN", stop=stop, target=target, tick=tick)
+                time.sleep(1); self.sync()
+                for _pid, _info in self.open_pos.items():
+                    if _info["sym"] == s and "entry" not in _info:
+                        _info.update({"entry": price, "stop": stop, "target": target, "side": 1,
+                                      "kind": "scanner", "qty": qty, "risk_frac": self.cfg.scanner_risk,
+                                      "eq_at_entry": eq})
+                held.add(s)
+            except Exception as ex:
+                logging.error(f"intrabar surge entry failed {s}: {ex}")
+            break   # one intrabar entry per poll cycle max
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
         self.selfcheck()
@@ -1279,6 +1338,7 @@ class Bot:
                 if not self.cfg.dry_run:
                     self.sync()
                     self.check_triggers()
+                    self.check_intrabar_surge()
                     self.manage_exits()
                 eq=self.equity()
                 if eq<=0:
