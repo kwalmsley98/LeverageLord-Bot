@@ -125,6 +125,17 @@ def binance_klines(symbol, interval="4h", limit=100):
             last_err = str(e)
     raise RuntimeError(f"binance klines failed for {symbol}: {last_err}")
 
+import html as _html
+_ERR_SEEN = {}
+def err_once(key, msg):
+    """Log always; Telegram at most once per hour per key."""
+    logging.error(msg)
+    now = time.time()
+    if now - _ERR_SEEN.get(key, 0) > 3600:
+        _ERR_SEEN[key] = now
+        try: notify(_html.escape(msg)[:400])
+        except Exception: pass
+
 def sparkline(vals, width=24):
     if not vals: return ""
     vals = vals[-width:]
@@ -490,6 +501,10 @@ class Bot:
         for v in vals[1:]: out.append(v*k+out[-1]*(1-k))
         return out
 
+    def open_risk(self):
+        """Risk committed across ALL engines, from live tracked positions."""
+        return sum(i.get("risk_frac", 0) for i in self.open_pos.values())
+
     def detect_signal(self, sym, rows):
         """Returns (side, kind, atr) or (0,None,0). Signals: donchian / ignition per signal_map."""
         closes=[r["c"] for r in rows]
@@ -524,7 +539,7 @@ class Bot:
 
     def run_symbol(self, sym, equity):
         try:
-            rows = binance_klines(sym, self.cfg.interval, 200)
+            rows = binance_klines(sym, self.cfg.interval, self.cfg.ema_trend + 20)   # v7 fix: was 200 < 205 -> core engine never ran
         except Exception as e:
             logging.warning(f"BINANCE FEED DOWN ({e}) - falling back to Bitunix klines for {sym}")
             rows = self.client.klines(sym, self.cfg.interval, 200)
@@ -568,7 +583,7 @@ class Bot:
         stop = price*(1-rd) if new_side>0 else price*(1+rd)
         target = price*(1+self.cfg.tp_r*rd) if new_side>0 else price*(1-self.cfg.tp_r*rd)
         risk = self.cfg.risk_map.get(sym, self.cfg.risk_per_trade)
-        if sum(i.get("risk",0) for i in self.entry_info.values()) + risk > self.cfg.max_open_risk:
+        if self.open_risk() + risk > self.cfg.max_open_risk:
             logging.info(f"{sym}: skipped, open-risk cap reached"); return
         qty = min(risk/rd, self.cfg.max_notional_lev)*equity/price
         qty = max(qty, self.cfg.min_qty_map.get(sym, 0), self.cfg.min_notional_usdt/price)
@@ -1223,8 +1238,23 @@ class Bot:
                f"⚠️ <b>Trading involves real risk.</b> Start small, never risk what you can't afford to lose, "
                f"and let the stops do their job." + foot())
 
+    def selfcheck(self):
+        lines = []
+        for sym in ("ETHUSDT","SOLUSDT"):
+            try:
+                rows = binance_klines(sym, self.cfg.interval, 30)
+                has_tb = rows[-1].get("tb", -1) >= 0
+                lines.append(f"{sym}: {len(rows)} bars ({'binance' if has_tb else 'bitunix-fallback'}) · taker data: {'yes' if has_tb else 'NO'}")
+            except Exception as e:
+                lines.append(f"{sym}: NO FEED ({e})")
+        try: lines.append(f"account equity: ${self.equity():.2f}")
+        except Exception as e: lines.append(f"account: FAIL ({e})")
+        lines.append(f"mode {self.cfg.mode} · poll {self.cfg.poll_seconds}s")
+        notify("<b>SELF-CHECK</b>\n" + "\n".join(lines))
+
     def loop(self):
         logging.info(f"Bot v5 starting. dry_run={self.cfg.dry_run}")
+        self.selfcheck()
         valid = None if self.cfg.dry_run else self.client.valid_symbols()
         if valid:
             bad = [s for s in self.cfg.symbols if s not in valid]
@@ -1258,8 +1288,11 @@ class Bot:
                     time.sleep(self.cfg.poll_seconds); continue
                 if self.risk.daily_loss_hit(eq) or self.risk.kill_switch():
                     time.sleep(self.cfg.poll_seconds); continue
-                for sym in self.cfg.symbols: self.run_symbol(sym, eq)
-                self.run_scanner(eq)
+                for sym in self.cfg.symbols:
+                    try: self.run_symbol(sym, eq)
+                    except Exception as ex: err_once(f"sym-{sym}", f"{sym} cycle error: {ex}")
+                try: self.run_scanner(eq)
+                except Exception as ex: err_once("scanner", f"scanner error: {ex}")
                 beats += 1
                 if beats >= beats_between:
                     beats = 0
