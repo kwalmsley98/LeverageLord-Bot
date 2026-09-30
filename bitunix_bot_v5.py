@@ -1262,7 +1262,7 @@ class Bot:
         if not self.scan_data: return
         if self.open_risk() + self.cfg.scanner_risk > self.cfg.max_open_risk: return
         held = {i["sym"] for i in self.open_pos.values()} | {t["sym"] for t in self.triggers}
-        watch = [s for g, s in self.last_scan.get("top", [])[:4] if g > 0] + ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        watch = [s for s, g in self.last_scan.get("top", [])[:4] if g > 0] + ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         iv = INTERVAL_MS.get(self.cfg.interval, 14400e3)
         for s in dict.fromkeys(watch):
             if s in held or s not in self.scan_data: continue
@@ -1336,10 +1336,10 @@ class Bot:
         while True:
             try:
                 if not self.cfg.dry_run:
-                    self.sync()
-                    self.check_triggers()
-                    self.check_intrabar_surge()
-                    self.manage_exits()
+                    for eng, fn in (("sync", self.sync), ("triggers", self.check_triggers),
+                                    ("intrabar", self.check_intrabar_surge), ("exits", self.manage_exits)):
+                        try: fn()
+                        except Exception as ex: err_once(f"eng-{eng}", f"{eng} engine error: {ex}")
                 eq=self.equity()
                 if eq<=0:
                     if not getattr(self,"_warned_eq",False):
@@ -1383,7 +1383,14 @@ class Bot:
                 self.poll_commands()
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
-                logging.error(f"loop error: {ex}", exc_info=True); time.sleep(60)   # traceback names the line
+                logging.error(f"loop error: {ex}", exc_info=True)
+                self._consec = getattr(self, "_consec", 0) + 1
+                if self._consec >= 5:
+                    notify("☠️ <b>BOT CRASH-RESTARTING</b>\n5 consecutive loop errors - exiting so Railway reboots me clean.")
+                    logging.error("crash-restart: 5 consecutive loop errors"); os._exit(1)
+                time.sleep(60)
+            else:
+                self._consec = 0
 
 
 # ==================== ACCESS BOT (funnel delivery) ====================
