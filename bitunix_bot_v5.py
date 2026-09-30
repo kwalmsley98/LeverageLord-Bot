@@ -466,7 +466,8 @@ class Bot:
                 if R is None and info.get("entry") and info.get("stop"):
                     try:
                         mk = self.client.ticker_px(info["sym"]) or self.client.klines(info["sym"], self.cfg.interval, 1)[-1]["c"]
-                        R = (mk-info["entry"])/abs(info["entry"]-info["stop"])*info.get("side",1)
+                        if abs(mk/info["entry"] - 1) < 0.25:     # reject corrupt price reads (>25% move = bad data)
+                            R = (mk-info["entry"])/abs(info["entry"]-info["stop"])*info.get("side",1)
                     except Exception:
                         R = None
                 if not (info.get("entry") and info.get("stop")):
@@ -474,6 +475,9 @@ class Bot:
                     notify(f"⚪ <b>{info['sym']} closed externally</b> - not counted in the record (no entry data on adopted position)")
                     self.state[info["sym"]] = 0; self.entry_info.pop(info["sym"], None); del self.open_pos[pid]; continue
                 if R is None: R = 1.0 if info["pnl"]>0 else -1.0
+                self._mr_cool = getattr(self, "_mr_cool", {})
+                self._mr_cool[info["sym"]] = time.time()
+                R = max(-3.0, min(3.5, R))            # sanity clamp: corrupt data can never poison the record
                 if info.get("kind") != "test":
                     self.risk.record_trade(R>0)
                 wins = sum(self.risk.trades); n = len(self.risk.trades)
@@ -1041,6 +1045,9 @@ class Bot:
             except Exception as e:
                 logging.error(f"managed exit failed {info['sym']}: {e}")
                 continue
+            self._mr_cool = getattr(self, "_mr_cool", {})
+            self._mr_cool[info["sym"]] = time.time()
+            R = max(-3.0, min(3.5, R))
             if info.get("kind") != "test":
                 self.risk.record_trade(R > 0)
             wins = sum(self.risk.trades); n = len(self.risk.trades)
@@ -1260,12 +1267,17 @@ class Bot:
         """Mid-bar volume-shift entries: forming candle's volume pace vs average, checked every poll.
         Fires on the volume increase the user asked for - no waiting for the 4h close."""
         if not self.scan_data: return
+        now = time.time()
+        self._mr_cool = getattr(self, "_mr_cool", {})
+        for s, t in list(self._mr_cool.items()):
+            if now - t > 7200: del self._mr_cool[s]
         if self.open_risk() + self.cfg.scanner_risk > self.cfg.max_open_risk: return
         held = {i["sym"] for i in self.open_pos.values()} | {t["sym"] for t in self.triggers}
         watch = [s for s, g in self.last_scan.get("top", [])[:4] if g > 0] + ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         iv = INTERVAL_MS.get(self.cfg.interval, 14400e3)
         for s in dict.fromkeys(watch):
             if s in held or s not in self.scan_data: continue
+            if now - self._mr_cool.get(s, 0) < 1800: continue   # 30min per-symbol cooldown
             r = self.scan_data[s]
             try:
                 cur = binance_klines(s, self.cfg.interval, 1)   # forming bar
@@ -1307,6 +1319,7 @@ class Bot:
                                       "kind": "scanner", "qty": qty, "risk_frac": self.cfg.scanner_risk,
                                       "eq_at_entry": eq})
                 held.add(s)
+                self._mr_cool[s] = now
             except Exception as ex:
                 logging.error(f"intrabar surge entry failed {s}: {ex}")
             break   # one intrabar entry per poll cycle max
