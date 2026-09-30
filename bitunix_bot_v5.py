@@ -238,16 +238,17 @@ class BitunixClient:
         raise RuntimeError("flash_close failed on all paths")
 
     def set_leverage(self, symbol, leverage):
+        errs = []
         for path in ["/api/v1/futures/account/leverage", "/api/v1/futures/trade/leverage",
-                     "/api/v1/futures/position/leverage"]:
+                     "/api/v1/futures/account/set_leverage", "/api/v1/futures/position/leverage"]:
             try:
                 self._req("POST", path, payload={"symbol": symbol, "marginCoin": "USDT",
                                                  "leverage": str(int(leverage))})
                 logging.info(f"leverage set {symbol} {leverage}x")
                 return True
-            except Exception:
-                continue
-        logging.warning(f"set_leverage failed for {symbol} (all paths) - using current setting")
+            except Exception as e:
+                errs.append(f"{path}: {str(e)[:80]}")
+        logging.warning(f"set_leverage failed for {symbol} | " + " | ".join(errs))
         return False
 
     def ticker_px(self, symbol):
@@ -356,6 +357,8 @@ class BitunixClient:
                     return ("bracket", self._place(symbol, side, q2, trade_side, order_type, price, stop, target, tick, position_id=position_id))
                 except Exception as e:
                     last_e = e
+                    if "LEVERAGE VETO" in str(e):
+                        raise                  # never trade without confirmed leverage
                     if "10002" in str(e):
                         continue                      # wrong qty precision -> next step
                     logging.warning(f"bracket rejected ({e}) - trying plain order")
@@ -370,6 +373,8 @@ class BitunixClient:
         try:
             return ("bracket", self._place(symbol, side, qty, trade_side, order_type, price, stop, target, tick, position_id=position_id))
         except Exception as e:
+            if "LEVERAGE VETO" in str(e):
+                raise
             if "place_order" in str(e):
                 logging.warning(f"bracket rejected ({e}) - placing plain order, bot will manage exit")
                 return ("plain", self._place(symbol, side, qty, trade_side, order_type, price, None, None, tick, position_id=position_id))
@@ -388,7 +393,9 @@ class BitunixClient:
                 atr = abs(target - stop) / 3.5
                 entry_est = (stop + atr) if side == "BUY" else (stop - atr)
                 stop_pct = atr / max(entry_est, 1e-9)
-                self.set_leverage(symbol, max(5, min(25, int(0.9 / (3 * stop_pct)))))
+                lev = max(5, min(15, int(0.9 / (3 * stop_pct))))
+                if not self.set_leverage(symbol, lev):
+                    raise RuntimeError(f"LEVERAGE VETO: could not set {lev}x on {symbol} - refusing to trade into unknown liquidation distance")
             except Exception as e:
                 logging.warning(f"auto-leverage skipped: {e}")
         if trade_side=="OPEN" and stop and target:
@@ -1277,7 +1284,7 @@ class Bot:
         iv = INTERVAL_MS.get(self.cfg.interval, 14400e3)
         for s in dict.fromkeys(watch):
             if s in held or s not in self.scan_data: continue
-            if now - self._mr_cool.get(s, 0) < 1800: continue   # 30min per-symbol cooldown
+            if now - self._mr_cool.get(s, 0) < 600: continue   # 30min per-symbol cooldown
             r = self.scan_data[s]
             try:
                 cur = binance_klines(s, self.cfg.interval, 1)   # forming bar
