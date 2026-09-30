@@ -938,7 +938,7 @@ class Bot:
             r = requests.get(f"https://api.telegram.org/bot{_TG_TOKEN}/getUpdates",
                              params={"offset": self.tg_offset, "timeout": 0}, timeout=10).json()
             for u in r.get("result", []):
-                self.tg_offset = u["update_id"] + 1
+                self.tg_offset = int(u["update_id"]) + 1
                 msg = u.get("message", {})
                 if str(msg.get("chat", {}).get("id")) != str(_TG_CHAT): continue
                 text = (msg.get("text") or "").strip().lower()
@@ -1383,7 +1383,7 @@ class Bot:
                 self.poll_commands()
                 time.sleep(self.cfg.poll_seconds)
             except Exception as ex:
-                logging.error(f"loop error: {ex}"); time.sleep(60)
+                logging.error(f"loop error: {ex}", exc_info=True); time.sleep(60)   # traceback names the line
 
 
 # ==================== ACCESS BOT (funnel delivery) ====================
